@@ -2,38 +2,146 @@ package summarizer
 
 import (
 	"context"
-	"github.com/bytedance/gopkg/util/logger"
-	"github.com/cloudwego/eino/adk"
+	"fmt"
+	"strings"
+
+	"github.com/Pcapchu/Pcapchu/middlewares/logger"
+	"github.com/Pcapchu/Pcapchu/middlewares/token_counter"
+	"github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/components/prompt"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
-	"strings"
 )
 
-type ContextSummarizerImpl interface {
+// ConversationSummarizer compresses conversation message history when it exceeds the token budget.
+type ConversationSummarizer interface {
 	SummarizeContext(ctx context.Context, input []*schema.Message) []*schema.Message
 }
 
-type DefaultContextSummarizer struct {
-	counter    func(ctx context.Context, msgs []adk.Message) (tokenNum []int64, err error)
+// ReportSummarizer compresses accumulated round reports.
+type ReportSummarizer interface {
+	SummarizeText(ctx context.Context, text string, previousSummary string) (string, error)
+}
+
+// DefaultConversationSummarizer implements ConversationSummarizer with configurable token budgets and LLM-based compression.
+type DefaultConversationSummarizer struct {
+	counter    token_counter.TokenCounterImpl
 	maxBefore  int
 	maxRecent  int
 	summarizer compose.Runnable[map[string]any, *schema.Message]
+	log        logger.Log
 }
 
-func NewDefaultContextSummarizer() *DefaultContextSummarizer {
-	
-}
+// NewDefaultConversationSummarizer creates a conversation summarizer.
+func NewDefaultConversationSummarizer(ctx context.Context, cfg *Config, log logger.Log) (*DefaultConversationSummarizer, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 
-// impl type MessageModifier func(ctx context.Context, input []*schema.Message) []*schema.Message
-func (cs *DefaultContextSummarizer) SummarizeContext(ctx context.Context, input []*schema.Message) []*schema.Message {
-	messages := input
-	msgsToken, err := cs.counter(ctx, messages)
+	sysPrompt := cfg.SystemPrompt
+	if sysPrompt == "" {
+		sysPrompt = cfg.defaultConversationPrompt()
+	}
+
+	compiled, err := buildSummarizerGraph(ctx, sysPrompt, cfg.Model)
 	if err != nil {
-		logger.Fatalf("compress error")
+		return nil, err
+	}
+
+	counter := cfg.Counter
+	if counter == nil {
+		counter = token_counter.DefaultTokenCounter{}
+	}
+
+	return &DefaultConversationSummarizer{
+		counter:    counter,
+		maxBefore:  cfg.GetMaxTokensBeforeSummary(),
+		maxRecent:  cfg.GetMaxTokensForRecentMessages(),
+		summarizer: compiled,
+		log:        log,
+	}, nil
+}
+
+// DefaultReportSummarizer implements ReportSummarizer for compressing round reports.
+type DefaultReportSummarizer struct {
+	model        model.BaseChatModel
+	systemPrompt string
+	log          logger.Log
+}
+
+// NewDefaultReportSummarizer creates a report summarizer.
+func NewDefaultReportSummarizer(cfg *Config, log logger.Log) (*DefaultReportSummarizer, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
+	sysPrompt := cfg.ReportPrompt
+	if sysPrompt == "" {
+		sysPrompt = cfg.defaultReportPrompt()
+	}
+
+	return &DefaultReportSummarizer{
+		model:        cfg.Model,
+		systemPrompt: sysPrompt,
+		log:          log,
+	}, nil
+}
+
+// SummarizeText compresses report text using the LLM.
+// If previousSummary is non-empty, the model merges old and new content.
+func (rs *DefaultReportSummarizer) SummarizeText(ctx context.Context, text string, previousSummary string) (string, error) {
+	content := text
+	if previousSummary != "" {
+		content = fmt.Sprintf("## Previous Compressed Summary\n\n%s\n\n---\n\n## New Reports to Integrate\n\n%s", previousSummary, text)
+	}
+
+	resp, err := rs.model.Generate(ctx, []*schema.Message{
+		schema.SystemMessage(rs.systemPrompt),
+		schema.UserMessage(content),
+	})
+	if err != nil {
+		rs.log.Error(ctx, "report summarizer: LLM invocation failed", logger.A(logger.AttrError, err.Error()))
+		return "", fmt.Errorf("summarize reports: %w", err)
+	}
+	return resp.Content, nil
+}
+
+// buildSummarizerGraph builds the template → model graph used for conversation summarization.
+func buildSummarizerGraph(ctx context.Context, sysPrompt string, m model.BaseChatModel) (compose.Runnable[map[string]any, *schema.Message], error) {
+	tpl := prompt.FromMessages(schema.GoTemplate,
+		schema.SystemMessage(sysPrompt),
+		schema.UserMessage("{{.user_content}}"),
+	)
+
+	modelLambda := compose.InvokableLambda(func(ctx context.Context, in []*schema.Message) (*schema.Message, error) {
+		return m.Generate(ctx, in)
+	})
+
+	g := compose.NewGraph[map[string]any, *schema.Message]()
+	_ = g.AddChatTemplateNode("template", tpl)
+	_ = g.AddLambdaNode("model", modelLambda)
+	_ = g.AddEdge(compose.START, "template")
+	_ = g.AddEdge("template", "model")
+	_ = g.AddEdge("model", compose.END)
+
+	compiled, err := g.Compile(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("compile summarizer graph: %w", err)
+	}
+	return compiled, nil
+}
+
+// SummarizeContext compresses conversation history when token count exceeds the budget.
+// impl type MessageModifier func(ctx context.Context, input []*schema.Message) []*schema.Message
+func (cs *DefaultConversationSummarizer) SummarizeContext(ctx context.Context, input []*schema.Message) []*schema.Message {
+	messages := input
+	msgsToken, err := cs.counter.CountToken(ctx, messages)
+	if err != nil {
+		cs.log.Error(ctx, "summarizer: token counting failed", logger.A(logger.AttrError, err.Error()))
 		return input
 	}
 	if len(messages) != len(msgsToken) {
-		logger.Fatalf("compress error")
+		cs.log.Error(ctx, "summarizer: token count mismatch", logger.A("messages", len(messages)), logger.A("counts", len(msgsToken)))
 		return input
 	}
 

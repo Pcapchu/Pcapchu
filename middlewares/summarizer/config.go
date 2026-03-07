@@ -1,13 +1,12 @@
 package summarizer
 
 import (
+	"github.com/Pcapchu/Pcapchu/internal/prompts"
+	"github.com/Pcapchu/Pcapchu/middlewares/token_counter"
 	"github.com/cloudwego/eino/components/model"
 )
 
-// Config defines parameters for the conversation summarization middleware.
-//
-// It controls when summarization is triggered, how much recent context is retained,
-// and how the summarization is performed.
+// Config defines parameters for the summarization middleware.
 //
 // Required fields:
 //   - Model: The language model used to generate summaries
@@ -15,44 +14,35 @@ import (
 // Optional fields:
 //   - MaxTokensBeforeSummary: Trigger threshold (default: 128K)
 //   - MaxTokensForRecentMessages: Recent message budget (default: 25K)
-//   - Counter: Custom token counter (default: cl100k_base encoding)
-//   - SystemPrompt: Summarization prompt (default: built-in prompt)
+//   - Counter: Custom token counter (default: DefaultTokenCounter)
+//   - SystemPrompt: Conversation summarization prompt (default: sum.md)
+//   - ReportPrompt: Report summarization prompt (default: sum_report.md)
 type Config struct {
 	// MaxTokensBeforeSummary is the maximum token threshold before triggering summarization.
-	//
-	// When the total token count of system prompt + conversation history exceeds this value,
-	// the middleware will initiate summarization of older messages.
-	//
-	// Default: DefaultMaxTokensBeforeSummary (128 * 1024 = 131,072 tokens)
-	// Set to 0 or negative to use default.
 	MaxTokensBeforeSummary int
 
 	// MaxTokensForRecentMessages is the token budget reserved for recent messages after summarization.
-	//
-	// After summarization, at most this many tokens of recent messages (counted from newest to oldest)
-	// will be retained in full detail. Older messages are condensed into a single summary message.
-	//
-	// Default: DefaultMaxTokensForRecentMessages (25 * 1024 = 25,600 tokens)
-	// Set to 0 or negative to use default.
 	MaxTokensForRecentMessages int
 
-	// Counter is a custom function for counting tokens in messages.
+	// Counter is the token counter implementation.
 	//
-	// Optional. If nil, the middleware uses defaultCounterToken which employs
-	// the cl100k_base encoding (OpenAI's tokenization).
-	Counter TokenCounter
+	// Optional. If nil, token_counter.DefaultTokenCounter is used.
+	Counter token_counter.TokenCounterImpl
 
 	// Model is the language model used to generate summaries.
 	//
-	// Required. This model will be invoked to summarize older conversation messages.
-	// Typically, you can use the same model as your main agent, but you may also
-	// use a smaller/faster model for cost efficiency.
+	// Required.
 	Model model.BaseChatModel
 
-	// SystemPrompt is the system prompt for the summarizer model.
+	// SystemPrompt is the system prompt for conversation summarization.
 	//
-	// Optional. If empty, PromptOfSummary (the built-in prompt) is used.
+	// Optional. If empty, the embedded sum.md prompt is used.
 	SystemPrompt string
+
+	// ReportPrompt is the system prompt for report summarization.
+	//
+	// Optional. If empty, the embedded sum_report.md prompt is used.
+	ReportPrompt string
 }
 
 // Defaults for conversation summarization.
@@ -92,4 +82,14 @@ func (c *Config) GetMaxTokensForRecentMessages() int {
 		return DefaultMaxTokensForRecentMessages
 	}
 	return c.MaxTokensForRecentMessages
+}
+
+// defaultConversationPrompt returns the embedded sum.md prompt.
+func (c *Config) defaultConversationPrompt() string {
+	return prompts.MustGet("sum")
+}
+
+// defaultReportPrompt returns the embedded sum_report.md prompt.
+func (c *Config) defaultReportPrompt() string {
+	return prompts.MustGet("sum_report")
 }
