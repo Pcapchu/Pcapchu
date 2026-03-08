@@ -1,0 +1,432 @@
+# AGENTS.md — Pcapchu Development Reference
+
+This file provides detailed context for coding agents working on the Pcapchu codebase.
+For a human-friendly overview, see [README.md](./README.md).
+
+---
+
+## Table of Contents
+
+- [Project Overview](#project-overview)
+- [Architecture](#architecture)
+  - [System Architecture](#system-architecture)
+  - [ReAct Agent Loop (Eino)](#react-agent-loop-eino)
+  - [Multi-Agent Pipeline](#multi-agent-pipeline)
+  - [Event System](#event-system)
+- [Project Structure](#project-structure)
+- [Build & Run](#build--run)
+- [Environment Variables](#environment-variables)
+- [Key Dependencies](#key-dependencies)
+- [Data Layer: pcapchu-scripts](#data-layer-pcapchu-scripts)
+- [Storage Schema](#storage-schema)
+- [Coding Conventions](#coding-conventions)
+- [Testing](#testing)
+
+---
+
+## Project Overview
+
+Pcapchu is an autonomous AI agent that investigates network packet captures.
+Given a pcap file and a natural-language query, it:
+
+1. Spins up an isolated Docker sandbox with Zeek, DuckDB, tshark, and Scapy.
+2. Runs a **Planner Agent** that inspects metadata and produces an investigation plan (JSON).
+3. Runs **Executor Agents** — one per plan step — that execute commands, collect findings, and build a research report.
+4. A **Round Summary Agent** (final executor) synthesizes all findings into a structured report.
+5. Persists session state (rounds, findings, pcap references) to SQLite for resume.
+
+Multiple investigation rounds can be executed, each building on the previous round's context.
+
+---
+
+## Architecture
+
+### System Architecture
+
+```
++--------+     +------------------+     +-------------------------+
+|  User  |---->|  CLI (cobra)     |---->|  Runtime Bootstrap      |
++--------+     |  cmd/main.go     |     |  internal/cli/          |
+               |  internal/cli/   |     |  - LLM client (OpenAI)  |
+               +------------------+     |  - Docker sandbox       |
+                                        |  - Logger + OTel        |
+                                        |  - Event emitter        |
+                                        +-----------+-------------+
+                                                    |
+                                                    v
+                                  +-----------------+------------------+
+                                  |        Investigation Loop          |
+                                  |  (per round, per session)          |
+                                  |                                    |
+                                  |  +----------+     +------------+  |
+                                  |  | Planner  |---->| Executor   |  |
+                                  |  | Agent    |     | Agent(s)   |  |
+                                  |  +----------+     +------+-----+  |
+                                  |       |                  |         |
+                                  |       v                  v         |
+                                  |  +----------------------------+   |
+                                  |  |     Docker Sandbox          |   |
+                                  |  |  +-----------------------+  |   |
+                                  |  |  | pcapchu-scripts       |  |   |
+                                  |  |  | (Zeek + DuckDB)       |  |   |
+                                  |  |  +-----------------------+  |   |
+                                  |  |  | bash / tshark / scapy |  |   |
+                                  |  |  +-----------------------+  |   |
+                                  |  +----------------------------+   |
+                                  +-----------------+------------------+
+                                                    |
+                                                    v
+                                  +-----------------+------------------+
+                                  |           Persistence              |
+                                  |  +----------+  +--------------+   |
+                                  |  | SQLite   |  | Event Bus    |   |
+                                  |  | (sqlx)   |  | (channels)   |   |
+                                  |  +----------+  +--------------+   |
+                                  +------------------------------------+
+```
+
+### ReAct Agent Loop (Eino)
+
+Each agent (Planner and Executor) uses the Eino framework's ReAct pattern.
+The loop follows this flow for each agent invocation:
+
+```
+1. Input Messages
+        |
+        v
++-------+--------+
+| StatePreHandler |  2-1. Add input/tool messages to state
+|   (prepare)     |  2-2. Use state's message list as ChatModel input
++---------+-------+  2-3. Decorate message list by user's Modifier
+          |
+          v
+  +-------+-------+
+  |   ChatModel   |  3. LLM generates a response
+  | (OpenAI API)  |
+  +-------+-------+
+          |
+          v  ChatResponse
+    +-----+------+
+    | tool call? |  4. Check first frame for tool calls
+    +-----+------+
+      |         |
+      | N       | Y
+      v         v
+  +---+---+ +---+------------+
+  |  End  | | StatePreHandler|  5. Add tool call message to state
+  +---+---+ +--------+-------+
+      |               |
+      v               v
+  Final         +-----+------+
+  Message       |  ToolsNode |  6. Execute tool, get Tool Response
+                +-----+------+
+                      |
+                      v
+                Go back to ChatModel (step 3)
+```
+
+Key configuration:
+- Planner Agent: `maxStep = 15` (lightweight, mostly metadata queries)
+- Executor Agent: `maxStep = 200` (deep analysis with conversation summarization)
+- The Executor Agent uses a `MessageRewriter` for context window management
+  via the Conversation Summarizer middleware.
+
+### Multi-Agent Pipeline
+
+Each investigation round runs the following pipeline:
+
+```
+                     Round N
+                        |
+                        v
++----------+    +--------------+    +------------------+
+| Load     |--->| Planner      |--->| Plan (JSON)      |
+| History  |    | Agent        |    | {thought, steps,  |
+| (SQLite) |    | (maxStep=15) |    |  table_schema}   |
++----------+    +--------------+    +--------+---------+
+                                             |
+           +---------------------------------+
+           |
+           v
+   +-------+--------+
+   | For each step:  |
+   |                 |
+   |  step 1..N-1:  |     +--------------+     +------------------+
+   |  Normal Step   |---->| Executor     |---->| Append findings  |
+   |                |     | Agent        |     | to research      |
+   |                |     | (maxStep=200)|     | report           |
+   |                |     +--------------+     +------------------+
+   |                |
+   |  step N:       |     +--------------+     +------------------+
+   |  Final Step    |---->| Round Summary|---->| {summary,        |
+   |                |     | Agent        |     |  key_findings,   |
+   |                |     |              |     |  open_questions} |
+   +-------+--------+     +--------------+     +--------+---------+
+           |                                            |
+           v                                            v
+   +-------+--------+                          +--------+---------+
+   | Save Round     |                          | Print Round      |
+   | to SQLite      |                          | Summary          |
+   +----------------+                          +------------------+
+```
+
+Normal Executor prompt: `internal/prompts/normal_executor.md`
+Final Executor prompt: `internal/prompts/final_executor.md`
+Planner prompt: `internal/prompts/planner.md`
+
+### Event System
+
+The event bus uses Go channels with configurable buffer size (default: 1024).
+`Emit()` is blocking (no silent drops). Events are typed:
+
+```
+session.created     session.resumed
+analysis.started    analysis.completed
+pcap.loaded
+round.started       round.completed
+step.completed
+```
+
+Subscribers receive `Event{Type, Source, Timestamp, Data}` via channel.
+
+---
+
+## Project Structure
+
+```
+Pcapchu/
+|-- cmd/
+|   `-- main.go                    # Entry point — calls cli.Execute()
+|-- internal/
+|   |-- cli/                       # CLI layer (cobra commands + runtime)
+|   |   |-- root.go                #   Root command, Execute(), --db flag
+|   |   |-- runtime.go             #   Runtime bootstrap, investigation loop, ReAct factory
+|   |   |-- analyze.go             #   "analyze" subcommand, resumeSession()
+|   |   |-- session.go             #   "session list/resume/delete"
+|   |   `-- pcap.go                #   "pcap list/delete"
+|   |-- common/
+|   |   |-- types.go               #   Plan, NormalOutput, RoundSummary, SessionHistory
+|   |   `-- utils.go               #   Shared utilities
+|   |-- events/
+|   |   `-- events.go              #   ChannelEmitter, event types, subscriber channels
+|   |-- executor/
+|   |   `-- executor.go            #   Executor graph (normal + final step pipeline)
+|   |-- planner/
+|   |   `-- planner.go             #   Planner graph (prompt + ReAct + JSON parse)
+|   |-- prompts/
+|   |   |-- prompts.go             #   Prompt template loader (embed)
+|   |   |-- planner.md             #   Planner system prompt
+|   |   |-- normal_executor.md     #   Normal executor system prompt
+|   |   |-- final_executor.md      #   Round summary agent prompt
+|   |   |-- analyzer_introduction.md  # Shared sandbox context
+|   |   `-- sum.md                 #   Conversation summarizer prompt
+|   `-- storage/
+|       |-- models.go              #   PcapFile, Session, Round, list item models
+|       `-- store.go               #   SQLite CRUD (sqlx), schema DDL
+|-- middlewares/
+|   |-- logger/
+|   |   |-- logger.go              #   Log interface, Logger struct, Emit()
+|   |   |-- sink.go                #   Sink interface, NopSink, MultiSink
+|   |   |-- console_sink.go        #   slogpretty-based console sink (truncation here)
+|   |   |-- slog_sink.go           #   slog adapter helpers
+|   |   |-- otel_sink.go           #   OpenTelemetry sink (logs + traces + metrics)
+|   |   |-- otel_setup.go          #   OTel provider bootstrap (InitOTel)
+|   |   `-- logger_callback.go     #   Eino callback handler (logs input/output)
+|   |-- summarizer/
+|   |   |-- config.go              #   Summarizer configuration
+|   |   |-- define.go              #   Error definitions
+|   |   `-- summary.go             #   Conversation summarizer (context window mgmt)
+|   `-- token_counter/
+|       `-- token_counter.go       #   tiktoken-based token counting
+|-- sandbox/
+|   |-- environment/
+|   |   `-- docker.go              #   DockerEnv: container lifecycle, file copy
+|   `-- tools/
+|       |-- bash.go                #   BashTool (command execution in sandbox)
+|       |-- safe_sre.go            #   SafeStrReplaceEditor tool
+|       `-- safe_wrapper.go        #   Tool safety wrapper
+`-- pcapchu-scripts/               # Python data layer (separate project, copied here)
+    `-- src/pcapchu_scripts/
+        |-- cli.py                 #   CLI: init, meta, query, ingest, serve
+        |-- service.py             #   Facade: PcapchuScripts orchestrator
+        |-- db.py                  #   DuckDB wrapper
+        |-- zeek.py                #   Zeek runner
+        |-- pkt2flow.py            #   pkt2flow + flow_index table
+        |-- ingest.py              #   Log discovery + DuckDB ingestion
+        |-- metadata.py            #   Schema catalogue (_meta_tables)
+        |-- query.py               #   SQL execution with row limit
+        |-- toon.py                #   Token-Oriented Object Notation encoder
+        |-- types.py               #   Domain dataclasses
+        `-- errors.py              #   Exception hierarchy
+```
+
+---
+
+## Build & Run
+
+### Build
+
+```bash
+go build -o pcapchu ./cmd/
+```
+
+### Lint / Vet
+
+```bash
+go vet ./...
+```
+
+### Run
+
+```bash
+# New analysis
+./pcapchu analyze --pcap capture.pcap --query "Find security threats" --rounds 2
+
+# Store pcap in SQLite
+./pcapchu analyze --pcap capture.pcap --store-pcap
+
+# Resume a session
+./pcapchu session resume <session-id> --rounds 1
+
+# List sessions / pcap files
+./pcapchu session list
+./pcapchu pcap list
+```
+
+### Docker Sandbox Image
+
+The sandbox image `pcapchu/sandbox:amd64` must be available. It contains:
+- Ubuntu 24.04, user `linuxbrew` with passwordless sudo
+- Python 3.12 venv with scapy, pyshark, pandas
+- Zeek, tshark, pkt2flow
+- pcapchu-scripts (installed via uv/pip)
+- Homebrew package manager
+
+---
+
+## Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `OPENAI_API_KEY` | Yes | API key for LLM |
+| `OPENAI_MODEL_NAME` | Yes | Model name (e.g. `gpt-4o`, `deepseek-chat`) |
+| `OPENAI_BASE_URL` | No | Base URL for OpenAI-compatible API |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | No | Enables OTel export (e.g. `http://localhost:4317`) |
+| `OTEL_EXPORTER_OTLP_HEADERS` | No | Auth headers for OTel endpoint |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | No | gRPC timeout in ms |
+| `OTEL_EXPORTER_OTLP_INSECURE` | No | `true` for HTTP endpoints |
+
+---
+
+## Key Dependencies
+
+| Package | Version | Purpose |
+|---|---|---|
+| `github.com/cloudwego/eino` | v0.7.37 | AI agent framework (ReAct, graph, callbacks) |
+| `github.com/cloudwego/eino-ext/components/model/openai` | v0.1.8 | OpenAI chat model |
+| `github.com/spf13/cobra` | v1.10.2 | CLI framework |
+| `github.com/jmoiron/sqlx` | v1.4.0 | SQL helper layer |
+| `modernc.org/sqlite` | v1.46.1 | Pure-Go SQLite driver |
+| `github.com/Marlliton/slogpretty` | v0.1.3 | Pretty console log handler |
+| `go.opentelemetry.io/otel` | v1.42.0 | OpenTelemetry SDK |
+| `github.com/docker/docker` | v28.0.4 | Docker API client |
+| `github.com/pkoukk/tiktoken-go` | v0.1.8 | Token counting |
+| `github.com/bytedance/sonic` | v1.15.0 | Fast JSON (Go 1.25 compat) |
+
+---
+
+## Data Layer: pcapchu-scripts
+
+`pcapchu-scripts` is a Python CLI tool that provides the structured data layer
+inside the Docker sandbox.
+
+### Pipeline
+
+```
+pcap file
+     |
+     v
+  zeek -C -r capture.pcap          -- produces JSON log files
+     |
+     v
+  DuckDB ingestion                  -- each .log -> a table (conn, dns, http, ...)
+     |
+     v
+  pkt2flow                          -- splits pcap into per-flow .pcap files
+     |
+     v
+  flow_index table                  -- SQL-queryable index of flow files
+     |
+     v
+  _meta_tables                      -- schema catalogue for AI agent consumption
+```
+
+### Commands (used by agents inside the sandbox)
+
+```bash
+cd /home/linuxbrew && pcapchu-scripts init <pcap>     # Full pipeline
+cd /home/linuxbrew && pcapchu-scripts meta             # Print schema (TOON format)
+cd /home/linuxbrew && pcapchu-scripts query "<SQL>"    # Execute DuckDB SQL
+```
+
+### Key Tables
+
+| Table | Description |
+|---|---|
+| `conn` | Connection records (5-tuple, duration, bytes, history) |
+| `dns` | DNS queries and responses |
+| `http` | HTTP requests (host, URI, method, response fuids) |
+| `ssl` | TLS/SSL handshake info |
+| `files` | File analysis (MIME type, hash, extracted path) |
+| `flow_index` | Per-flow pcap file paths (from pkt2flow) |
+| `_meta_tables` | Schema catalogue (table name, row count, columns) |
+
+---
+
+## Storage Schema
+
+SQLite database (`--db` flag, default `./pcapchu.db`):
+
+```sql
+-- Pcap binary blobs (optional, deduplicated by SHA-256)
+pcap_files (id, filename, size, sha256 UNIQUE, data BLOB, created_at)
+
+-- Investigation sessions
+sessions (id TEXT PK, user_query, pcap_file_id FK -> pcap_files ON DELETE SET NULL,
+          pcap_path, findings_summary, report_summary, created_at, updated_at)
+
+-- Per-round investigation results
+rounds (id, session_id FK -> sessions ON DELETE CASCADE, round,
+        research_findings, operation_log, summary, key_findings,
+        open_questions, compressed, created_at, UNIQUE(session_id, round))
+```
+
+---
+
+## Coding Conventions
+
+- **Go version**: 1.25+ (module: `github.com/Pcapchu/Pcapchu`)
+- **Imports**: stdlib, then project packages, then third-party. Grouped with blank lines.
+- **Error handling**: `fmt.Errorf("context: %w", err)` — always wrap with context.
+- **Logging**: Use `logger.Log` interface. Never use `fmt.Println` for operational output (use structured logging or events).
+- **Sinks**: Console sink truncates long strings (default 2000 chars). OTel sink gets full data.
+- **CLI**: All terminal-facing logic lives in `internal/cli/`. `cmd/main.go` is a thin wrapper.
+- **Prompts**: Markdown templates in `internal/prompts/`, loaded via Go embed. Template variables use `{{.var_name}}`.
+- **Events**: Typed event constants in `internal/events/events.go`. Emit via `logger.Emit()`.
+- **Storage**: All DB interaction through `internal/storage/Store` methods. Schema migrations in DDL const.
+
+---
+
+## Testing
+
+Currently no automated test suite. Verify changes with:
+
+```bash
+go vet ./...
+go build -o /dev/null ./cmd/
+```
+
+End-to-end testing requires:
+1. Docker running with `pcapchu/sandbox:amd64` image available
+2. Valid `OPENAI_API_KEY` and `OPENAI_MODEL_NAME` set
+3. A pcap file: `./pcapchu analyze --pcap capture.pcap`
