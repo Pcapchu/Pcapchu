@@ -196,6 +196,11 @@ func (e *Executor) Run(ctx context.Context, plan common.Plan, userQuery string, 
 			Actions:  parsed.MyActions.String(),
 		})
 
+		e.log.Emit(events.TypeStepCompleted, events.StepCompletedData{
+			StepID:     step.StepID,
+			TotalSteps: len(state.Plan.Steps),
+		})
+
 		// --- Capture state via closure for Result ---
 		captureMu.Lock()
 		capturedFindings = state.ResearchFindings

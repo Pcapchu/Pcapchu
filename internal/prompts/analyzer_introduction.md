@@ -14,9 +14,11 @@ You are operating within a specialized **Ubuntu 24.04 Docker container** designe
 
 ### Workflow
 
-1. **Init**: `pcapchu-scripts init <pcap>` (Ingests PCAP, runs Zeek & pkt2flow).
-2. **Meta**: `pcapchu-scripts meta` (Returns schema. **ALWAYS run first**).
-3. **Query**: `pcapchu-scripts query "<SQL>"` (Execute SQL).
+1. **Init**: `cd /home/linuxbrew && pcapchu-scripts init <pcap>` (Ingests PCAP, runs Zeek & pkt2flow).
+2. **Meta**: `cd /home/linuxbrew && pcapchu-scripts meta` (Returns schema. **ALWAYS run first**).
+3. **Query**: `cd /home/linuxbrew && pcapchu-scripts query "<SQL>"` (Execute SQL).
+
+> **Always `cd /home/linuxbrew` before running `pcapchu-scripts`.**
 
 ### Data Model
 

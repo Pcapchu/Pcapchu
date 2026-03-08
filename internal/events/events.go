@@ -8,6 +8,21 @@ import (
 
 // Event types for frontend consumption.
 const (
+	// Session lifecycle
+	TypeSessionCreated = "session.created"
+	TypeSessionResumed = "session.resumed"
+
+	// Analysis lifecycle
+	TypeAnalysisStarted   = "analysis.started"
+	TypeAnalysisCompleted = "analysis.completed"
+
+	// Pcap loading
+	TypePcapLoaded = "pcap.loaded"
+
+	// Round lifecycle
+	TypeRoundStarted   = "round.started"
+	TypeRoundCompleted = "round.completed"
+
 	// Planner events
 	TypePlanCreated = "plan.created"
 	TypePlanError   = "plan.error"
@@ -51,6 +66,40 @@ func NewEvent(eventType string, sessionID string, data any) Event {
 
 // --- Typed event data structs (frontend-friendly JSON) ---
 
+type SessionCreatedData struct {
+	SessionID  string `json:"session_id"`
+	UserQuery  string `json:"user_query"`
+	PcapSource string `json:"pcap_source"` // "file" or "db"
+}
+
+type SessionResumedData struct {
+	SessionID string `json:"session_id"`
+	FromRound int    `json:"from_round"`
+}
+
+type AnalysisData struct {
+	SessionID   string `json:"session_id"`
+	TotalRounds int    `json:"total_rounds"`
+}
+
+type PcapLoadedData struct {
+	Source   string `json:"source"` // "file" or "db"
+	Path     string `json:"path"`   // container-side path
+	Size     int64  `json:"size"`
+	Filename string `json:"filename"`
+}
+
+type RoundStartedData struct {
+	Round       int `json:"round"`
+	TotalRounds int `json:"total_rounds"`
+}
+
+type RoundCompletedData struct {
+	Round       int    `json:"round"`
+	Summary     string `json:"summary"`
+	KeyFindings string `json:"key_findings"`
+}
+
 type PlanCreatedData struct {
 	Thought    string     `json:"thought"`
 	TotalSteps int        `json:"total_steps"`
@@ -73,6 +122,11 @@ type StepFindingsData struct {
 	Intent   string `json:"intent"`
 	Findings string `json:"findings"`
 	Actions  string `json:"actions"`
+}
+
+type StepCompletedData struct {
+	StepID     int `json:"step_id"`
+	TotalSteps int `json:"total_steps"`
 }
 
 type ReportData struct {

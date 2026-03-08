@@ -23,6 +23,12 @@ import (
 	"reflect"
 )
 
+// ANSI colour escapes used by Tokenf.
+const (
+	colorBrown = "\033[31;1m"
+	colorReset = "\033[0m"
+)
+
 // ---------------------------------------------------------------------------
 // Logger — unified observability handle
 // ---------------------------------------------------------------------------
@@ -107,11 +113,11 @@ func (l *Logger) Error(ctx context.Context, msg string, attrs ...Attr) {
 // --- Domain events ---
 
 // Emit processes a domain event through two paths:
-//  1. Sink.SpanEvent — truncated to maxContentLen (configurable, 0 = no truncation).
+//  1. Sink.SpanEvent — full untruncated attrs (each sink decides its own truncation).
 //  2. EmitFunc — original untruncated data for streaming API consumers.
 func (l *Logger) Emit(eventType string, data any) {
 	attrs := flattenToAttrs(data)
-	l.Sink().SpanEvent(context.Background(), eventType, truncateAttrs(attrs, l.maxContentLen)...)
+	l.Sink().SpanEvent(context.Background(), eventType, attrs...)
 	if l.emit != nil {
 		l.emit(eventType, data)
 	}

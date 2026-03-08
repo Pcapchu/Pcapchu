@@ -28,9 +28,11 @@ The Planner has already run `pcapchu-scripts meta`. Below is the database schema
 ### A. pcapchu-scripts (Zeek + DuckDB) — Primary
 
 ```bash
-pcapchu-scripts init <pcap>        # Ingest PCAP (if not already done)
-pcapchu-scripts query "<SQL>"      # Execute DuckDB SQL query
+cd /home/linuxbrew && pcapchu-scripts init <pcap>        # Ingest PCAP (if not already done)
+cd /home/linuxbrew && pcapchu-scripts query "<SQL>"      # Execute DuckDB SQL query
 ```
+
+> **Always `cd /home/linuxbrew` before running `pcapchu-scripts`.**
 
 **SQL syntax notes:**
 - Wrap dotted column names in double quotes: `"id.orig_h"`.

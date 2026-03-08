@@ -8,6 +8,8 @@ import (
 	"io"
 
 	"github.com/cloudwego/eino/callbacks"
+	"github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/flow/agent/react"
 	"github.com/cloudwego/eino/schema"
 )
@@ -24,18 +26,71 @@ func NewLoggerCallback(log Log) *LoggerCallback {
 
 func (cb *LoggerCallback) OnStart(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
 	cb.Step++
-	if cb.log != nil {
-		cb.log.Info(ctx, "callback.start",
-			A(AttrComponent, info.Type), A(AttrNodeName, info.Name), A(AttrCallbackStep, cb.Step))
+	if cb.log == nil {
+		return ctx
 	}
+
+	attrs := []Attr{
+		A(AttrComponent, info.Type),
+		A(AttrNodeName, info.Name),
+		A(AttrCallbackStep, cb.Step),
+	}
+
+	// Try typed model input.
+	if mi := model.ConvCallbackInput(input); mi != nil {
+		attrs = append(attrs, A(AttrMessageCount, len(mi.Messages)))
+		if len(mi.Messages) > 0 {
+			last := mi.Messages[len(mi.Messages)-1]
+			attrs = append(attrs, A("last_role", last.Role))
+			attrs = append(attrs, A("last_content", truncate(last.Content, 500)))
+		}
+		if mi.Config != nil && mi.Config.Model != "" {
+			attrs = append(attrs, A(AttrModelName, mi.Config.Model))
+		}
+	}
+
+	// Try typed tool input.
+	if ti := tool.ConvCallbackInput(input); ti != nil {
+		attrs = append(attrs, A("arguments_json", truncate(ti.ArgumentsInJSON, 500)))
+	}
+
+	cb.log.Info(ctx, "callback.start", attrs...)
 	return ctx
 }
 
 func (cb *LoggerCallback) OnEnd(ctx context.Context, info *callbacks.RunInfo, output callbacks.CallbackOutput) context.Context {
-	if cb.log != nil {
-		cb.log.Info(ctx, "callback.end",
-			A(AttrComponent, info.Type), A(AttrNodeName, info.Name))
+	if cb.log == nil {
+		return ctx
 	}
+
+	attrs := []Attr{
+		A(AttrComponent, info.Type),
+		A(AttrNodeName, info.Name),
+	}
+
+	// Try typed model output.
+	if mo := model.ConvCallbackOutput(output); mo != nil {
+		if mo.Message != nil {
+			attrs = append(attrs, A("role", mo.Message.Role))
+			attrs = append(attrs, A(AttrContentLength, len(mo.Message.Content)))
+			attrs = append(attrs, A("content", truncate(mo.Message.Content, 500)))
+			if len(mo.Message.ToolCalls) > 0 {
+				attrs = append(attrs, A("tool_calls", len(mo.Message.ToolCalls)))
+			}
+		}
+		if mo.TokenUsage != nil {
+			attrs = append(attrs, A(AttrTokenPrompt, mo.TokenUsage.PromptTokens))
+			attrs = append(attrs, A(AttrTokenCompletion, mo.TokenUsage.CompletionTokens))
+			attrs = append(attrs, A(AttrTokenTotal, mo.TokenUsage.TotalTokens))
+		}
+	}
+
+	// Try typed tool output.
+	if to := tool.ConvCallbackOutput(output); to != nil {
+		attrs = append(attrs, A("response", truncate(to.Response, 500)))
+	}
+
+	cb.log.Info(ctx, "callback.end", attrs...)
 	return ctx
 }
 
@@ -59,13 +114,12 @@ func (cb *LoggerCallback) OnEndWithStreamOutput(ctx context.Context, info *callb
 			}
 		}()
 
-		defer output.Close() // remember to close the stream in defer
+		defer output.Close()
 
 		fmt.Println("=========[OnEndStream]=========")
 		for {
 			frame, err := output.Recv()
 			if errors.Is(err, io.EOF) {
-				// finish
 				break
 			}
 			if err != nil {
@@ -79,7 +133,7 @@ func (cb *LoggerCallback) OnEndWithStreamOutput(ctx context.Context, info *callb
 				return
 			}
 
-			if info.Name == graphInfoName { // 仅打印 graph 的输出, 否则每个 stream 节点的输出都会打印一遍
+			if info.Name == graphInfoName {
 				fmt.Printf("%s: %s\n", info.Name, string(s))
 			}
 		}
@@ -92,4 +146,16 @@ func (cb *LoggerCallback) OnStartWithStreamInput(ctx context.Context, info *call
 	input *schema.StreamReader[callbacks.CallbackInput]) context.Context {
 	defer input.Close()
 	return ctx
+}
+
+// truncate shortens a string to maxLen runes, appending "..." if truncated.
+func truncate(s string, maxLen int) string {
+	if maxLen <= 0 || len(s) <= maxLen {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= maxLen {
+		return s
+	}
+	return string(r[:maxLen]) + "..."
 }
