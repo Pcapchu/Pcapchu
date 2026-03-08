@@ -1,0 +1,38 @@
+# Go
+Pcapchu
+pcapchu
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# SQLite
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+env.sh
+.env
+.env.*
+
+# pcap files (large binary, don't commit)
+*.pcap
+*.pcapng
+
+# pcapchu-scripts Python artifacts
+pcapchu-scripts

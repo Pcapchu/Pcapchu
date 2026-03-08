@@ -62,7 +62,7 @@ func dockerInternals(ds *sandbox.DockerSandbox) (*client.Client, string) {
 
 // NewDockerEnv creates and starts a Docker-based environment.
 func NewDockerEnv(ctx context.Context) (*DockerEnv, error) {
-	ds, err := sandbox.NewDockerSandbox(ctx, &sandbox.Config{Image: "pcapchu/sandbox:amd64"})
+	ds, err := sandbox.NewDockerSandbox(ctx, &sandbox.Config{Image: "pcapchu/sandbox:amd64", WorkDir: "/home/linuxbrew", NetworkEnabled: false})
 	if err != nil {
 		return nil, fmt.Errorf("new docker sandbox: %w", err)
 	}
