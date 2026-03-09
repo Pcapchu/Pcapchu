@@ -3,7 +3,6 @@ module github.com/Pcapchu/Pcapchu
 go 1.25.5
 
 require (
-	github.com/Marlliton/slogpretty v0.1.3
 	github.com/cloudwego/eino v0.7.37
 	github.com/cloudwego/eino-ext/components/model/openai v0.1.8
 	github.com/cloudwego/eino-ext/components/tool/commandline v0.0.0-20260306073537-008f82264d85

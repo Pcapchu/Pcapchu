@@ -9,4 +9,4 @@ Pcapchu is an **autonomous AI agent** that investigates network packet captures 
 - **SQL-first analysis** — pcap → Zeek logs → DuckDB tables → SQL queries, powered by [pcapchu-scripts](./pcapchu-scripts/).
 - **Docker sandbox** — all commands execute inside an isolated container. No tools installed on the host.
 - **Multi-round investigation** — persist sessions to SQLite; resume and run additional rounds at any time.
-- **Observability** — structured logging via [slogpretty](https://github.com/Marlliton/slogpretty), optional OpenTelemetry traces/metrics/logs export.
+- **Observability** — structured logging via [slogpretty](https://github.com/Marlliton/slogpretty), optional OpenTelemetry traces/metrics/logs export.q

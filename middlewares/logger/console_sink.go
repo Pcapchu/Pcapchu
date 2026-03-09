@@ -1,15 +1,13 @@
 package logger
 
 import (
-	"context"
-	"log/slog"
-	"os"
-
-	"github.com/Marlliton/slogpretty"
+"context"
+"log/slog"
+"os"
 )
 
 // ConsoleSink is a Sink that prints colored, human-readable output to stdout
-// via the slogpretty handler. String attributes longer than maxContentLen are
+// via the prettyHandler. String attributes longer than maxContentLen are
 // truncated for readability (0 = no truncation).
 type ConsoleSink struct {
 	logger        *slog.Logger
@@ -20,20 +18,13 @@ const defaultMaxContentLen = 2000
 
 // NewConsoleSink creates a compact single-line console sink.
 func NewConsoleSink() Sink {
-	h := slogpretty.New(os.Stdout, &slogpretty.Options{
-		Level:    slog.LevelDebug,
-		Colorful: true,
-	})
+	h := newPrettyHandler(os.Stdout, slog.LevelDebug, true, false)
 	return &ConsoleSink{logger: slog.New(h), maxContentLen: defaultMaxContentLen}
 }
 
 // NewPrettyConsoleSink creates a multi-line aligned console sink.
 func NewPrettyConsoleSink() Sink {
-	h := slogpretty.New(os.Stdout, &slogpretty.Options{
-		Level:     slog.LevelDebug,
-		Colorful:  true,
-		Multiline: true,
-	})
+	h := newPrettyHandler(os.Stdout, slog.LevelDebug, true, true)
 	return &ConsoleSink{logger: slog.New(h), maxContentLen: defaultMaxContentLen}
 }
 

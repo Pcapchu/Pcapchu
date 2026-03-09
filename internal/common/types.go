@@ -13,19 +13,21 @@ type Step struct {
 
 // Plan is the top-level structure returned by the Planner LLM.
 type Plan struct {
-	Thought     string `json:"thought"`
-	TableSchema string `json:"table_schema"`
-	Steps       []Step `json:"steps"`
+	Thought       string `json:"thought"`
+	EnrichedInput string `json:"enriched_input"`
+	TableSchema   string `json:"table_schema"`
+	Steps         []Step `json:"steps"`
 }
 
 // PlanState is the mutable state carried through the executor graph loop.
 type PlanState struct {
-	Plan             Plan
-	TableSchema      string
-	CurrentStepIndex int
-	ResearchFindings string
-	OperationLog     []string
-	EndOutput        string
+	Plan               Plan
+	TableSchema        string
+	KeyFindingsHistory string
+	CurrentStepIndex   int
+	ResearchFindings   string
+	OperationLog       []string
+	EndOutput          string
 }
 
 // NormalOutput is the parsed JSON output from a NormalExecutor step.

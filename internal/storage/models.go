@@ -74,3 +74,14 @@ type PcapListItem struct {
 	SHA256    string    `db:"sha256"`
 	CreatedAt time.Time `db:"created_at"`
 }
+
+// HistorySnapshot stores a compressed snapshot of accumulated history entries.
+// The "scope" field identifies what was compressed (e.g. "planner_history", "key_findings").
+type HistorySnapshot struct {
+	ID             int64     `db:"id"`
+	SessionID      string    `db:"session_id"`
+	Scope          string    `db:"scope"`
+	CompressedUpTo int       `db:"compressed_up_to"` // round number up to which entries were compressed
+	Content        string    `db:"content"`
+	CreatedAt      time.Time `db:"created_at"`
+}

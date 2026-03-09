@@ -10,9 +10,12 @@ import (
 	"path/filepath"
 	"unsafe"
 
+	sbx "github.com/Pcapchu/Pcapchu/sandbox"
+
 	"github.com/cloudwego/eino-ext/components/tool/commandline"
 	"github.com/cloudwego/eino-ext/components/tool/commandline/sandbox"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 )
 
@@ -62,7 +65,14 @@ func dockerInternals(ds *sandbox.DockerSandbox) (*client.Client, string) {
 
 // NewDockerEnv creates and starts a Docker-based environment.
 func NewDockerEnv(ctx context.Context) (*DockerEnv, error) {
-	ds, err := sandbox.NewDockerSandbox(ctx, &sandbox.Config{Image: "pcapchu/sandbox:amd64", WorkDir: "/home/linuxbrew", NetworkEnabled: false})
+	imageName := sbx.ImageName()
+
+	// Check if the image exists locally; if not, offer to pull it.
+	if err := ensureImage(ctx, imageName); err != nil {
+		return nil, err
+	}
+
+	ds, err := sandbox.NewDockerSandbox(ctx, &sandbox.Config{Image: imageName, NetworkEnabled: false})
 	if err != nil {
 		return nil, fmt.Errorf("new docker sandbox: %w", err)
 	}
@@ -139,4 +149,37 @@ func (d *DockerEnv) copyTar(ctx context.Context, destPath string, data []byte) e
 // Deprecated: use NewDockerEnv instead.
 func GetOperator(ctx context.Context) (commandline.Operator, error) {
 	return NewDockerEnv(ctx)
+}
+
+// ensureImage checks whether the Docker image exists locally.
+// If missing, it prompts the user and pulls on confirmation.
+func ensureImage(ctx context.Context, imageName string) error {
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return fmt.Errorf("create docker client: %w", err)
+	}
+	defer cli.Close()
+
+	_, err = cli.ImageInspect(ctx, imageName)
+	if err == nil {
+		return nil // image exists
+	}
+
+	fmt.Printf("Docker image %q not found locally. Pull it? [y/N] ", imageName)
+	var answer string
+	fmt.Scanln(&answer)
+	if answer != "y" && answer != "Y" {
+		return fmt.Errorf("docker image %q not available", imageName)
+	}
+
+	fmt.Printf("Pulling %s ...\n", imageName)
+	reader, err := cli.ImagePull(ctx, imageName, image.PullOptions{})
+	if err != nil {
+		return fmt.Errorf("pull image %q: %w", imageName, err)
+	}
+	defer reader.Close()
+	// Consume the stream to complete the pull.
+	_, _ = io.Copy(io.Discard, reader)
+	fmt.Println("Image pulled successfully.")
+	return nil
 }

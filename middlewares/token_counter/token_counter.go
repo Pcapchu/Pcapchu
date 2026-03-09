@@ -13,6 +13,7 @@ import (
 
 type TokenCounterImpl interface {
 	CountToken(ctx context.Context, msgs []adk.Message) (tokenNum []int64, err error)
+	CountStringTokens(ctx context.Context, texts []string) (tokenNum []int64, err error)
 }
 
 type DefaultTokenCounter struct {
@@ -92,4 +93,18 @@ func (tc DefaultTokenCounter) CountToken(ctx context.Context, msgs []adk.Message
 	}
 
 	return tokenNum, nil
+}
+
+// CountStringTokens counts tokens for plain text strings.
+func (tc DefaultTokenCounter) CountStringTokens(_ context.Context, texts []string) ([]int64, error) {
+	const encoding = "cl100k_base"
+	tkt, err := tiktoken.GetEncoding(encoding)
+	if err != nil {
+		return nil, fmt.Errorf("get encoding failed, encoding=%v, err=%w", encoding, err)
+	}
+	out := make([]int64, len(texts))
+	for i, t := range texts {
+		out[i] = int64(len(tkt.Encode(t, nil, nil)))
+	}
+	return out, nil
 }

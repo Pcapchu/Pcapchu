@@ -12,6 +12,8 @@ import (
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/flow/agent/react"
 	"github.com/cloudwego/eino/schema"
+
+	"github.com/Pcapchu/Pcapchu/middlewares/token_counter"
 )
 
 type LoggerCallback struct {
@@ -42,10 +44,20 @@ func (cb *LoggerCallback) OnStart(ctx context.Context, info *callbacks.RunInfo, 
 		if len(mi.Messages) > 0 {
 			last := mi.Messages[len(mi.Messages)-1]
 			attrs = append(attrs, A("last_role", last.Role))
+			attrs = append(attrs, A("last_content_length", len(last.Content)))
 			attrs = append(attrs, A("last_content", truncate(last.Content, 500)))
 		}
 		if mi.Config != nil && mi.Config.Model != "" {
 			attrs = append(attrs, A(AttrModelName, mi.Config.Model))
+		}
+		// Estimate token usage for the entire message list.
+		tc := token_counter.DefaultTokenCounter{}
+		if counts, err := tc.CountToken(ctx, mi.Messages); err == nil {
+			var total int64
+			for _, c := range counts {
+				total += c
+			}
+			attrs = append(attrs, A("estimated_tokens", total))
 		}
 	}
 

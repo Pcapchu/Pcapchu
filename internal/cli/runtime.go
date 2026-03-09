@@ -7,8 +7,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 
+	"github.com/Pcapchu/Pcapchu/internal/common"
 	"github.com/Pcapchu/Pcapchu/internal/events"
 	"github.com/Pcapchu/Pcapchu/internal/executor"
 	"github.com/Pcapchu/Pcapchu/internal/planner"
@@ -36,7 +39,9 @@ type runtime struct {
 	env          environment.Env
 	planner      *planner.Planner
 	exec         *executor.Executor
+	compressor   *summarizer.HistoryCompressor
 	otelShutdown func(context.Context)
+	cleanupOnce  sync.Once
 }
 
 func newRuntime(parentCtx context.Context) (*runtime, error) {
@@ -105,7 +110,7 @@ func newRuntime(parentCtx context.Context) (*runtime, error) {
 	}
 
 	// --- Tools ---
-	bashTool := tools.NewBashTool(env)
+	bashTool := tools.NewOutputGuard(tools.NewBashTool(env))
 	sreTool := tools.NewSafeStrReplaceEditor(ctx, env)
 	allTools := []tool.BaseTool{bashTool, sreTool}
 
@@ -148,9 +153,11 @@ func newRuntime(parentCtx context.Context) (*runtime, error) {
 		return nil, fmt.Errorf("create planner: %w", err)
 	}
 
-	exec := executor.NewExecutor(execAgent, log)
+	exec := executor.NewExecutor(execAgent, chatModel, log)
 
-	return &runtime{
+	compressor := summarizer.NewHistoryCompressor(chatModel, log)
+
+	rt := &runtime{
 		ctx:          ctx,
 		cancel:       cancel,
 		log:          log,
@@ -158,17 +165,32 @@ func newRuntime(parentCtx context.Context) (*runtime, error) {
 		env:          env,
 		planner:      p,
 		exec:         exec,
+		compressor:   compressor,
 		otelShutdown: otelShutdown,
-	}, nil
+	}
+
+	// Ensure cleanup runs when the context is cancelled (e.g. Ctrl+C).
+	// Close() is guarded by sync.Once so the deferred Close() in callers is safe.
+	go func() {
+		<-ctx.Done()
+		rt.Close()
+	}()
+
+	return rt, nil
 }
 
 func (r *runtime) Close() {
-	r.env.Cleanup(r.ctx)
-	if r.otelShutdown != nil {
-		r.otelShutdown(r.ctx)
-	}
-	r.emitter.Close()
-	r.cancel()
+	r.cleanupOnce.Do(func() {
+		// Use a fresh context — r.ctx may already be cancelled by the signal.
+		cleanupCtx := context.Background()
+		r.log.Info(cleanupCtx, "cleaning up...")
+		r.env.Cleanup(cleanupCtx)
+		if r.otelShutdown != nil {
+			r.otelShutdown(cleanupCtx)
+		}
+		r.emitter.Close()
+		r.cancel()
+	})
 }
 
 // copyPcapToContainer handles both file-path and DB-blob pcap sources.
@@ -194,6 +216,11 @@ func copyPcapToContainer(ctx context.Context, env environment.Env, sess *storage
 
 // runInvestigation is the shared investigation loop used by both "analyze" and "session resume".
 func runInvestigation(rt *runtime, store *storage.Store, sessionID, query, containerPcapPath string, startRound, endRound int) error {
+	const (
+		scopeKeyFindings    = "key_findings"
+		scopePlannerHistory = "planner_history"
+	)
+
 	for round := startRound; round <= endRound; round++ {
 		rt.log.Info(rt.ctx, fmt.Sprintf("========== Round %d/%d ==========", round, endRound))
 		rt.log.Emit(events.TypeRoundStarted, events.RoundStartedData{
@@ -201,24 +228,63 @@ func runInvestigation(rt *runtime, store *storage.Store, sessionID, query, conta
 			TotalRounds: endRound,
 		})
 
-		// Load history from previous rounds
-		var history *planner.PlannerInput
+		// --- Collect and compress key findings ---
+		keyFindingsHistory := ""
 		if round > 1 {
-			hist, err := store.LoadHistory(rt.ctx, sessionID)
+			kfEntries, err := collectScopedEntries(rt.ctx, store, sessionID, scopeKeyFindings, func(r storage.Round) string {
+				if r.KeyFindings == "" {
+					return ""
+				}
+				return fmt.Sprintf("Round %d Key Findings:\n%s", r.Round, r.KeyFindings)
+			})
 			if err != nil {
-				rt.log.Error(rt.ctx, "load history failed", logger.A(logger.AttrError, err.Error()))
+				rt.log.Error(rt.ctx, "collect key findings failed", logger.A(logger.AttrError, err.Error()))
 				break
 			}
-			history = &planner.PlannerInput{
+			if len(kfEntries) > 0 {
+				compressed, err := compressAndSnapshot(rt, store, sessionID, scopeKeyFindings, kfEntries)
+				if err != nil {
+					rt.log.Warn(rt.ctx, "compress key findings failed, using raw", logger.A(logger.AttrError, err.Error()))
+					keyFindingsHistory = strings.Join(kfEntries, "\n\n")
+				} else {
+					keyFindingsHistory = strings.Join(compressed, "\n\n")
+				}
+			}
+		}
+
+		// --- Collect and compress planner history ---
+		var planInput planner.PlannerInput
+		if round > 1 {
+			histEntries, err := collectScopedEntries(rt.ctx, store, sessionID, scopePlannerHistory, func(r storage.Round) string {
+				return formatRoundForPlanner(r)
+			})
+			if err != nil {
+				rt.log.Error(rt.ctx, "collect planner history failed", logger.A(logger.AttrError, err.Error()))
+				break
+			}
+
+			var historyText string
+			if len(histEntries) > 0 {
+				compressed, err := compressAndSnapshot(rt, store, sessionID, scopePlannerHistory, histEntries)
+				if err != nil {
+					rt.log.Warn(rt.ctx, "compress planner history failed, using raw", logger.A(logger.AttrError, err.Error()))
+					historyText = strings.Join(histEntries, "\n\n---\n\n")
+				} else {
+					historyText = strings.Join(compressed, "\n\n---\n\n")
+				}
+			}
+
+			// Build a SessionHistory from the (possibly compressed) text.
+			// The compressed text replaces the Findings field; we still load the
+			// most recent round's report for PreviousReport / AllReports.
+			lastRounds, _ := store.LoadRoundsAfter(rt.ctx, sessionID, 0)
+			hist := buildSessionHistory(historyText, lastRounds)
+
+			planInput = planner.PlannerInput{
 				UserQuery: query,
 				PcapPath:  containerPcapPath,
 				History:   hist,
 			}
-		}
-
-		var planInput planner.PlannerInput
-		if history != nil {
-			planInput = *history
 		} else {
 			planInput = planner.PlannerInput{
 				UserQuery: query,
@@ -233,7 +299,11 @@ func runInvestigation(rt *runtime, store *storage.Store, sessionID, query, conta
 		}
 		rt.log.Info(rt.ctx, "plan created", logger.A("steps", len(plan.Steps)), logger.A("thought", plan.Thought))
 
-		result, err := rt.exec.Run(rt.ctx, plan, query, containerPcapPath, round)
+		execQuery := plan.EnrichedInput
+		if execQuery == "" {
+			execQuery = query
+		}
+		result, err := rt.exec.Run(rt.ctx, plan, execQuery, containerPcapPath, round, keyFindingsHistory)
 		if err != nil {
 			rt.log.Error(rt.ctx, "executor failed", logger.A(logger.AttrError, err.Error()), logger.A("round", round))
 			break
@@ -245,7 +315,7 @@ func runInvestigation(rt *runtime, store *storage.Store, sessionID, query, conta
 			OperationLog:     result.OperationLog,
 			Summary:          result.Summary,
 			KeyFindings:      result.KeyFindings,
-			OpenQuestions:     result.OpenQuestions,
+			OpenQuestions:    result.OpenQuestions,
 		}); err != nil {
 			rt.log.Error(rt.ctx, "save round failed", logger.A(logger.AttrError, err.Error()))
 			break
@@ -266,6 +336,111 @@ func runInvestigation(rt *runtime, store *storage.Store, sessionID, query, conta
 		fmt.Println()
 	}
 	return nil
+}
+
+// collectScopedEntries loads entries from a snapshot + remaining rounds for a given scope.
+// The formatRound callback extracts the relevant text from each round; empty strings are skipped.
+func collectScopedEntries(ctx context.Context, store *storage.Store, sessionID, scope string, formatRound func(storage.Round) string) ([]string, error) {
+	snap, err := store.LoadSnapshot(ctx, sessionID, scope)
+	if err != nil {
+		return nil, fmt.Errorf("load snapshot (%s): %w", scope, err)
+	}
+
+	afterRound := 0
+	if snap != nil {
+		afterRound = snap.CompressedUpTo
+	}
+
+	rounds, err := store.LoadRoundsAfter(ctx, sessionID, afterRound)
+	if err != nil {
+		return nil, fmt.Errorf("load rounds after %d (%s): %w", afterRound, scope, err)
+	}
+
+	var entries []string
+	if snap != nil && snap.Content != "" {
+		entries = append(entries, snap.Content)
+	}
+	for _, r := range rounds {
+		if text := formatRound(r); text != "" {
+			entries = append(entries, text)
+		}
+	}
+	return entries, nil
+}
+
+// compressAndSnapshot runs the compressor on entries and persists a snapshot if compression occurred.
+// Returns the (possibly compressed) entries.
+func compressAndSnapshot(rt *runtime, store *storage.Store, sessionID, scope string, entries []string) ([]string, error) {
+	result, err := rt.compressor.Compress(rt.ctx, entries)
+	if err != nil {
+		return nil, err
+	}
+
+	if result.Compressed {
+		// Determine the absolute round number the snapshot covers.
+		snap, _ := store.LoadSnapshot(rt.ctx, sessionID, scope)
+		baseRound := 0
+		if snap != nil {
+			baseRound = snap.CompressedUpTo
+		}
+
+		remainingRounds, _ := store.LoadRoundsAfter(rt.ctx, sessionID, baseRound)
+		newCompressedUpTo := baseRound
+		if result.CompressedUpTo > 0 && result.CompressedUpTo <= len(remainingRounds) {
+			newCompressedUpTo = remainingRounds[result.CompressedUpTo-1].Round
+		}
+
+		if err := store.SaveSnapshot(rt.ctx, sessionID, scope, newCompressedUpTo, result.Entries[0]); err != nil {
+			rt.log.Error(rt.ctx, "save snapshot failed",
+				logger.A("scope", scope), logger.A(logger.AttrError, err.Error()))
+		} else {
+			rt.log.Info(rt.ctx, "history compressed",
+				logger.A("scope", scope), logger.A("compressed_up_to_round", newCompressedUpTo))
+		}
+	}
+
+	return result.Entries, nil
+}
+
+// formatRoundForPlanner builds a planner-history entry from a single round's data.
+func formatRoundForPlanner(r storage.Round) string {
+	var parts []string
+	if r.ResearchFindings != "" {
+		parts = append(parts, fmt.Sprintf("### Research Findings\n%s", r.ResearchFindings))
+	}
+	if r.Summary != "" {
+		parts = append(parts, fmt.Sprintf("### Summary\n%s", r.Summary))
+	}
+	if r.KeyFindings != "" {
+		parts = append(parts, fmt.Sprintf("### Key Findings\n%s", r.KeyFindings))
+	}
+	if r.OpenQuestions != "" {
+		parts = append(parts, fmt.Sprintf("### Open Questions\n%s", r.OpenQuestions))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("## Round %d\n\n%s", r.Round, strings.Join(parts, "\n\n"))
+}
+
+// buildSessionHistory constructs a SessionHistory from compressed history text
+// and the full (uncompressed) list of all rounds (for PreviousReport / AllReports).
+func buildSessionHistory(compressedText string, allRounds []storage.Round) *common.SessionHistory {
+	hist := &common.SessionHistory{
+		Findings: compressedText,
+	}
+
+	for _, r := range allRounds {
+		rr := common.RoundReport{
+			Round:        r.Round,
+			Summary:      r.Summary,
+			KeyFindings:  r.KeyFindings,
+			OpenQuestions: r.OpenQuestions,
+		}
+		hist.AllReports = append(hist.AllReports, rr)
+		hist.PreviousReport = &rr
+	}
+	return hist
 }
 
 // newReActAgent creates a react.Agent with the given tools, model, max steps,

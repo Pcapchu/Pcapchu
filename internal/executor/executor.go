@@ -4,13 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"sync"
+
 	"github.com/Pcapchu/Pcapchu/internal/common"
 	"github.com/Pcapchu/Pcapchu/internal/events"
 	"github.com/Pcapchu/Pcapchu/internal/prompts"
 	"github.com/Pcapchu/Pcapchu/middlewares/logger"
-	"strings"
-	"sync"
 
+	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/prompt"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/flow/agent/react"
@@ -40,23 +42,26 @@ type Result struct {
 	OperationLog string
 }
 
-// Executor wraps a compiled eino graph that executes all plan steps.
+// Executor wraps the ReAct agent used for normal investigation steps and
+// a plain ChatModel used for the final round summary (no tools needed).
 type Executor struct {
-	rAgent *react.Agent
-	log    logger.Log
+	rAgent     *react.Agent
+	summaryModel model.BaseChatModel
+	log        logger.Log
 }
 
-// NewExecutor creates a new Executor. The graph is built on each Run() call
-// because it captures per-run closure state.
-func NewExecutor(rAgent *react.Agent, log logger.Log) *Executor {
-	return &Executor{rAgent: rAgent, log: log}
+// NewExecutor creates a new Executor.
+// summaryModel is a plain ChatModel used for the final summary step (no ReAct/tools).
+func NewExecutor(rAgent *react.Agent, summaryModel model.BaseChatModel, log logger.Log) *Executor {
+	return &Executor{rAgent: rAgent, summaryModel: summaryModel, log: log}
 }
 
 // Run executes all steps in the plan and returns the final report plus captured state.
 // userQuery is the original user question, injected into executor prompts for context.
 // pcapPath is the container-side path to the target PCAP file.
 // round is the current investigation round number (1-based).
-func (e *Executor) Run(ctx context.Context, plan common.Plan, userQuery string, pcapPath string, round int) (*Result, error) {
+// keyFindingsHistory is a formatted summary of key findings from all previous rounds.
+func (e *Executor) Run(ctx context.Context, plan common.Plan, userQuery string, pcapPath string, round int, keyFindingsHistory string) (*Result, error) {
 	if len(plan.Steps) == 0 {
 		return nil, fmt.Errorf("plan has no steps")
 	}
@@ -79,12 +84,13 @@ func (e *Executor) Run(ctx context.Context, plan common.Plan, userQuery string, 
 			tableSchema = "(Table schema not available - run `pcapchu-scripts meta` if needed)"
 		}
 		return &common.PlanState{
-			Plan:             plan,
-			TableSchema:      tableSchema,
-			CurrentStepIndex: 0,
-			ResearchFindings: "",
-			OperationLog:     []string{},
-			EndOutput:        "",
+			Plan:               plan,
+			TableSchema:        tableSchema,
+			KeyFindingsHistory: keyFindingsHistory,
+			CurrentStepIndex:   0,
+			ResearchFindings:   "",
+			OperationLog:       []string{},
+			EndOutput:          "",
 		}
 	}
 
@@ -133,14 +139,20 @@ func (e *Executor) Run(ctx context.Context, plan common.Plan, userQuery string, 
 			findings = "(No research findings yet - you are the first executor)"
 		}
 
+		kfh := state.KeyFindingsHistory
+		if kfh == "" {
+			kfh = "(No previous round key findings yet - this is the first round)"
+		}
+
 		return map[string]any{
-			"user_query":        userQuery,
-			"pcap_path":         pcapPath,
-			"plan_overview":     planOverview,
-			"research_findings": findings,
-			"operation_log":     opLog,
-			"current_step":      fmt.Sprintf("Step %d: %s", step.StepID, step.Intent),
-			"table_schema":      state.TableSchema,
+			"user_query":           userQuery,
+			"pcap_path":            pcapPath,
+			"plan_overview":        planOverview,
+			"research_findings":    findings,
+			"operation_log":        opLog,
+			"current_step":         fmt.Sprintf("Step %d: %s", step.StepID, step.Intent),
+			"table_schema":         state.TableSchema,
+			"key_findings_history": kfh,
 		}, nil
 	}
 
@@ -262,6 +274,19 @@ func (e *Executor) Run(ctx context.Context, plan common.Plan, userQuery string, 
 		schema.UserMessage("Synthesize all findings into a phased round summary now."),
 	)
 
+	// final-model: plain ChatModel invocation (no tools / no ReAct)
+	finalModelLambda := compose.InvokableLambda(func(ctx context.Context, in []*schema.Message) (*schema.Message, error) {
+		e.log.Info(ctx, "FinalSummary-ChatModel input", logger.A(logger.AttrMessageCount, len(in)))
+		out, err := e.summaryModel.Generate(ctx, in)
+		if err != nil {
+			e.log.Error(ctx, "FinalSummary-ChatModel error", logger.A(logger.AttrError, err.Error()))
+			return nil, err
+		}
+		e.log.Info(ctx, "FinalSummary-ChatModel output",
+			logger.A("content", common.TruncateStr(out.Content, 500)))
+		return out, nil
+	})
+
 	// final-parse: extract JSON round summary from final executor output
 	finalParseLambda := compose.InvokableLambda(func(ctx context.Context, in *schema.Message) (string, error) {
 		e.log.Info(ctx, "final executor output",
@@ -318,7 +343,7 @@ func (e *Executor) Run(ctx context.Context, plan common.Plan, userQuery string, 
 
 	_ = g.AddLambdaNode(nodeFinalPrepare, finalPrepareLambda, compose.WithStatePostHandler(finalPreparePostHook))
 	_ = g.AddChatTemplateNode(nodeFinalTemplate, finalTpl)
-	_ = g.AddLambdaNode(nodeFinalReact, reactWithLog("ReAct-FinalExecutor"))
+	_ = g.AddLambdaNode(nodeFinalReact, finalModelLambda)
 	_ = g.AddLambdaNode(nodeFinalParse, finalParseLambda)
 
 	// Branch: is-last decides normal vs final path

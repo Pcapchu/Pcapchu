@@ -159,8 +159,8 @@ Each investigation round runs the following pipeline:
    |                |
    |  step N:       |     +--------------+     +------------------+
    |  Final Step    |---->| Round Summary|---->| {summary,        |
-   |                |     | Agent        |     |  key_findings,   |
-   |                |     |              |     |  open_questions} |
+   |                |     | (ChatModel   |     |  key_findings,   |
+   |                |     |  not ReAct)  |     |  open_questions} |
    +-------+--------+     +--------------+     +--------+---------+
            |                                            |
            v                                            v
@@ -180,14 +180,54 @@ The event bus uses Go channels with configurable buffer size (default: 1024).
 `Emit()` is blocking (no silent drops). Events are typed:
 
 ```
+// Session lifecycle
 session.created     session.resumed
+
+// Analysis lifecycle
 analysis.started    analysis.completed
+
+// Pcap
 pcap.loaded
+
+// Round lifecycle
 round.started       round.completed
-step.completed
+
+// Planner
+plan.created        plan.error
+
+// Executor
+step.started        step.findings
+step.completed      step.error
+
+// Final
+report.generated
+
+// General
+info                error
 ```
 
-Subscribers receive `Event{Type, Source, Timestamp, Data}` via channel.
+Subscribers receive `Event{Type, SessionID, Timestamp, Data}` via channel.
+
+Event data payloads (decoded from `Data json.RawMessage` based on `Type`):
+
+| Event Type | Data Struct | Key Fields |
+|---|---|---|
+| `session.created` | `SessionCreatedData` | SessionID, UserQuery, PcapSource |
+| `session.resumed` | `SessionResumedData` | SessionID, FromRound |
+| `analysis.started` | `AnalysisData` | SessionID, TotalRounds |
+| `analysis.completed` | `AnalysisData` | SessionID, TotalRounds |
+| `pcap.loaded` | `PcapLoadedData` | Source, Path, Size, Filename |
+| `round.started` | `RoundStartedData` | Round, TotalRounds |
+| `round.completed` | `RoundCompletedData` | Round, Summary, KeyFindings |
+| `plan.created` | `PlanCreatedData` | Thought, TotalSteps, Steps |
+| `plan.error` | `ErrorData` | Phase, Message, StepID |
+| `step.started` | `StepStartedData` | StepID, Intent, TotalSteps |
+| `step.findings` | `StepFindingsData` | StepID, Intent, Findings, Actions |
+| `step.completed` | `StepCompletedData` | StepID, TotalSteps |
+| `step.error` | `ErrorData` | Phase, Message, StepID |
+| `report.generated` | `ReportData` | Round, Report, ContentLen, TotalSteps, DurationMs |
+| `info` | `InfoData` | Message |
+| `error` | `ErrorData` | Phase, Message, StepID |
 
 ---
 
@@ -219,7 +259,8 @@ Pcapchu/
 |   |   |-- normal_executor.md     #   Normal executor system prompt
 |   |   |-- final_executor.md      #   Round summary agent prompt
 |   |   |-- analyzer_introduction.md  # Shared sandbox context
-|   |   `-- sum.md                 #   Conversation summarizer prompt
+|   |   |-- sum.md                 #   Conversation summarizer prompt
+|   |   `-- sum_report.md          #   Report summarizer prompt (history compression)
 |   `-- storage/
 |       |-- models.go              #   PcapFile, Session, Round, list item models
 |       `-- store.go               #   SQLite CRUD (sqlx), schema DDL
@@ -227,24 +268,30 @@ Pcapchu/
 |   |-- logger/
 |   |   |-- logger.go              #   Log interface, Logger struct, Emit()
 |   |   |-- sink.go                #   Sink interface, NopSink, MultiSink
-|   |   |-- console_sink.go        #   slogpretty-based console sink (truncation here)
+|   |   |-- console_sink.go        #   Console sink with content truncation
+|   |   |-- pretty_handler.go      #   Custom slog handler (colored, multi-line)
 |   |   |-- slog_sink.go           #   slog adapter helpers
 |   |   |-- otel_sink.go           #   OpenTelemetry sink (logs + traces + metrics)
 |   |   |-- otel_setup.go          #   OTel provider bootstrap (InitOTel)
 |   |   `-- logger_callback.go     #   Eino callback handler (logs input/output)
 |   |-- summarizer/
+|   |   |-- compressor.go          #   HistoryCompressor: LLM-based round history compression
 |   |   |-- config.go              #   Summarizer configuration
 |   |   |-- define.go              #   Error definitions
-|   |   `-- summary.go             #   Conversation summarizer (context window mgmt)
+|   |   `-- summary.go             #   Conversation & Report summarizers (context window mgmt)
 |   `-- token_counter/
 |       `-- token_counter.go       #   tiktoken-based token counting
 |-- sandbox/
+|   |-- Dockerfile                 #   Sandbox Docker image definition
+|   |-- dockerfile_version.txt     #   Image tag version (e.g. "v1.0")
+|   |-- image.go                   #   ImageName() — embeds version, returns repo:tag
 |   |-- environment/
 |   |   `-- docker.go              #   DockerEnv: container lifecycle, file copy
 |   `-- tools/
 |       |-- bash.go                #   BashTool (command execution in sandbox)
+|       |-- output_guard.go        #   OutputGuard: truncates oversized tool output
 |       |-- safe_sre.go            #   SafeStrReplaceEditor tool
-|       `-- safe_wrapper.go        #   Tool safety wrapper
+|       `-- safe_wrapper.go        #   Tool safety wrapper (errors → string results)
 `-- pcapchu-scripts/               # Python data layer (separate project, copied here)
     `-- src/pcapchu_scripts/
         |-- cli.py                 #   CLI: init, meta, query, ingest, serve
@@ -295,11 +342,16 @@ go vet ./...
 
 ### Docker Sandbox Image
 
-The sandbox image `pcapchu/sandbox:amd64` must be available. It contains:
+The sandbox image is built from `sandbox/Dockerfile` and tagged via
+`sandbox/dockerfile_version.txt` (currently `v1.0`).
+`sandbox.ImageName()` returns `pcapchu/sandbox:<version>`.
+
+It contains:
 - Ubuntu 24.04, user `linuxbrew` with passwordless sudo
-- Python 3.12 venv with scapy, pyshark, pandas
-- Zeek, tshark, pkt2flow
-- pcapchu-scripts (installed via uv/pip)
+- Python 3.12 venv with scapy, pyshark, pandas, ipython, requests, pytz
+- Zeek, tshark (via wireshark), pkt2flow (built from source)
+- gron, jq, tree
+- pcapchu-scripts (installed via uv/pip from GitHub)
 - Homebrew package manager
 
 ---
@@ -324,14 +376,15 @@ The sandbox image `pcapchu/sandbox:amd64` must be available. It contains:
 |---|---|---|
 | `github.com/cloudwego/eino` | v0.7.37 | AI agent framework (ReAct, graph, callbacks) |
 | `github.com/cloudwego/eino-ext/components/model/openai` | v0.1.8 | OpenAI chat model |
+| `github.com/cloudwego/eino-ext/components/tool/commandline` | v0.0.0-2026… | Sandbox command-line tool (bash, str_replace_editor) |
 | `github.com/spf13/cobra` | v1.10.2 | CLI framework |
 | `github.com/jmoiron/sqlx` | v1.4.0 | SQL helper layer |
 | `modernc.org/sqlite` | v1.46.1 | Pure-Go SQLite driver |
-| `github.com/Marlliton/slogpretty` | v0.1.3 | Pretty console log handler |
+| `github.com/google/uuid` | v1.6.0 | UUID generation (session IDs) |
 | `go.opentelemetry.io/otel` | v1.42.0 | OpenTelemetry SDK |
 | `github.com/docker/docker` | v28.0.4 | Docker API client |
 | `github.com/pkoukk/tiktoken-go` | v0.1.8 | Token counting |
-| `github.com/bytedance/sonic` | v1.15.0 | Fast JSON (Go 1.25 compat) |
+| `github.com/bytedance/sonic` | v1.15.0 | Fast JSON (indirect, Go 1.25 compat) |
 
 ---
 
@@ -367,6 +420,22 @@ pcap file
 cd /home/linuxbrew && pcapchu-scripts init <pcap>     # Full pipeline
 cd /home/linuxbrew && pcapchu-scripts meta             # Print schema (TOON format)
 cd /home/linuxbrew && pcapchu-scripts query "<SQL>"    # Execute DuckDB SQL
+cd /home/linuxbrew && pcapchu-scripts ingest           # Ingest existing Zeek logs only
+cd /home/linuxbrew && pcapchu-scripts serve            # Start stdin/stdout JSON-RPC server
+```
+
+**Global CLI options:** `-w/--work-dir` (working directory), `--db` (DuckDB path), `-v/--verbose`
+
+**`init` flags:** `--no-zeek`, `--no-pkt2flow`, `--keep-logs`
+
+**`query` flags:** `--limit` (max rows, default 50000)
+
+**`meta` flags:** `--json` (output JSON instead of TOON)
+
+**`serve` protocol:** Stdin/stdout JSON-RPC for AI agents:
+```json
+→ {"method": "query", "params": {"sql": "SELECT ...", "max_rows": 50000}}
+← {"result": {...}}
 ```
 
 ### Key Tables
@@ -399,6 +468,11 @@ sessions (id TEXT PK, user_query, pcap_file_id FK -> pcap_files ON DELETE SET NU
 rounds (id, session_id FK -> sessions ON DELETE CASCADE, round,
         research_findings, operation_log, summary, key_findings,
         open_questions, compressed, created_at, UNIQUE(session_id, round))
+
+-- Compressed history snapshots (one per session + scope)
+history_snapshots (id, session_id FK -> sessions ON DELETE CASCADE, scope,
+                   compressed_up_to, content, created_at,
+                   UNIQUE(session_id, scope))
 ```
 
 ---
@@ -409,7 +483,7 @@ rounds (id, session_id FK -> sessions ON DELETE CASCADE, round,
 - **Imports**: stdlib, then project packages, then third-party. Grouped with blank lines.
 - **Error handling**: `fmt.Errorf("context: %w", err)` — always wrap with context.
 - **Logging**: Use `logger.Log` interface. Never use `fmt.Println` for operational output (use structured logging or events).
-- **Sinks**: Console sink truncates long strings (default 2000 chars). OTel sink gets full data.
+- **Sinks**: Console sink truncates long strings (default 2000 chars). OTel sink gets full data. Pretty handler provides colored multi-line output.
 - **CLI**: All terminal-facing logic lives in `internal/cli/`. `cmd/main.go` is a thin wrapper.
 - **Prompts**: Markdown templates in `internal/prompts/`, loaded via Go embed. Template variables use `{{.var_name}}`.
 - **Events**: Typed event constants in `internal/events/events.go`. Emit via `logger.Emit()`.
@@ -427,6 +501,6 @@ go build -o /dev/null ./cmd/
 ```
 
 End-to-end testing requires:
-1. Docker running with `pcapchu/sandbox:amd64` image available
+1. Docker running with `pcapchu/sandbox:v1.0` image available
 2. Valid `OPENAI_API_KEY` and `OPENAI_MODEL_NAME` set
 3. A pcap file: `./pcapchu analyze --pcap capture.pcap`

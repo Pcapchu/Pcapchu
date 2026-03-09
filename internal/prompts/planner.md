@@ -100,6 +100,7 @@ Your output is a **single JSON object** with exactly three keys:
 ```
 {
   "thought": "<your chain-of-thought reasoning>",
+  "enriched_input": "<refined, precise restatement of the user's query>",
   "table_schema": "<verbatim output of pcapchu-scripts meta>",
   "steps": [
     {
@@ -113,6 +114,7 @@ Your output is a **single JSON object** with exactly three keys:
 | Field | Description |
 |-------|-------------|
 | `thought` | Your reasoning: what metadata you found, what tables are relevant, what the logical dependencies are. |
+| `enriched_input` | A refined, precise restatement of the user's original query. Disambiguate vague terms, resolve implicit references using metadata (e.g., map "the database" → specific IPs/ports, "suspicious traffic" → concrete indicators). This replaces the raw user query as the guiding question for all Executor Agents, so it must be **specific**, **self-contained**, and **actionable**. If the original query is already precise, return it unchanged. |
 | `table_schema` | The **exact text** returned by `pcapchu-scripts meta`. Executor agents receive this so they never need to query it again. |
 | `steps` | Ordered list of investigation steps. The last step is always the synthesis / final report step. |
 
@@ -129,6 +131,7 @@ Your output is a **single JSON object** with exactly three keys:
 ```json
 {
   "thought": "The 'conn' table contains duration, byte counts, and history fields that reveal TCP behavior. I will target port 3306 specifically. Step 1 retrieves raw stats; Step 2 analyzes retransmission patterns; Step 3 synthesizes.",
+  "enriched_input": "Investigate why TCP connections to destination port 3306 (MySQL) exhibit high latency. Determine whether the root cause is network-level (retransmissions, packet loss) or application-level (slow server response). Identify the specific source and destination hosts involved.",
   "table_schema": "conn: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p, proto, service, duration, orig_bytes, resp_bytes, history ...",
   "steps": [
     {
@@ -156,6 +159,7 @@ Your output is a **single JSON object** with exactly three keys:
 ```json
 {
   "thought": "I need to join 'http' and 'files' to correlate the source IP with downloaded file types. I will look for executable MIME types.",
+  "enriched_input": "Determine whether host 192.168.1.10 downloaded any executable files (MIME types: application/x-dosexec, application/x-executable, application/x-mach-binary, application/x-elf, application/x-msdownload) via HTTP. List each file with its filename, size, MD5 hash, and the remote server that served it.",
   "table_schema": "http: ts, uid, id.orig_h, host, uri, resp_fuids ...\nfiles: ts, fuid, mime_type, filename, total_bytes, md5, extracted ...",
   "steps": [
     {

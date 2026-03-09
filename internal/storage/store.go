@@ -56,6 +56,16 @@ CREATE TABLE IF NOT EXISTS rounds (
     created_at        DATETIME NOT NULL DEFAULT (datetime('now')),
     UNIQUE(session_id, round)
 );
+
+CREATE TABLE IF NOT EXISTS history_snapshots (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    scope            TEXT NOT NULL,
+    compressed_up_to INTEGER NOT NULL,
+    content          TEXT NOT NULL DEFAULT '',
+    created_at       DATETIME NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(session_id, scope)
+);
 `
 
 // New opens (or creates) the SQLite database at path and initialises the schema.
@@ -323,6 +333,54 @@ func (s *Store) RoundCount(ctx context.Context, sessionID string) (int, error) {
 		return 0, fmt.Errorf("count rounds: %w", err)
 	}
 	return count, nil
+}
+
+// ===================================================================
+// History Snapshots
+// ===================================================================
+
+// SaveSnapshot upserts a compressed history snapshot for the given session and scope.
+func (s *Store) SaveSnapshot(ctx context.Context, sessionID, scope string, compressedUpTo int, content string) error {
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO history_snapshots (session_id, scope, compressed_up_to, content, created_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(session_id, scope) DO UPDATE SET
+		   compressed_up_to = excluded.compressed_up_to,
+		   content = excluded.content,
+		   created_at = excluded.created_at`,
+		sessionID, scope, compressedUpTo, content, now)
+	if err != nil {
+		return fmt.Errorf("save snapshot: %w", err)
+	}
+	return nil
+}
+
+// LoadSnapshot loads a compressed history snapshot. Returns nil if none exists.
+func (s *Store) LoadSnapshot(ctx context.Context, sessionID, scope string) (*HistorySnapshot, error) {
+	var snap HistorySnapshot
+	err := s.db.GetContext(ctx, &snap,
+		`SELECT id, session_id, scope, compressed_up_to, content, created_at
+		 FROM history_snapshots WHERE session_id = ? AND scope = ?`, sessionID, scope)
+	if err != nil {
+		if err.Error() == "sql: no rows in result set" {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("load snapshot: %w", err)
+	}
+	return &snap, nil
+}
+
+// LoadRoundsAfter loads rounds with round > afterRound, ordered ascending.
+func (s *Store) LoadRoundsAfter(ctx context.Context, sessionID string, afterRound int) ([]Round, error) {
+	var rounds []Round
+	if err := s.db.SelectContext(ctx, &rounds,
+		`SELECT round, research_findings, operation_log, summary, key_findings, open_questions
+		 FROM rounds WHERE session_id = ? AND round > ? ORDER BY round ASC`,
+		sessionID, afterRound); err != nil {
+		return nil, fmt.Errorf("load rounds after %d: %w", afterRound, err)
+	}
+	return rounds, nil
 }
 
 // ===================================================================

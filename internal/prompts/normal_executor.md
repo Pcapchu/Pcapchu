@@ -93,19 +93,25 @@ cap = pyshark.FileCapture('input.pcap', display_filter='http')
 
 ---
 
-## 6. Accumulated Research Findings
+## 6. Key Findings From Previous Rounds
+
+{{.key_findings_history}}
+
+---
+
+## 7. Accumulated Research Findings
 
 {{.research_findings}}
 
 ---
 
-## 7. Operation Log (Previous Agents' Actions)
+## 8. Operation Log (Previous Agents' Actions)
 
 {{.operation_log}}
 
 ---
 
-## 8. Your Current Assignment
+## 9. Your Current Assignment
 
 **Current Step:** {{.current_step}}
 
@@ -120,7 +126,7 @@ Before using **any** tool, answer this question internally:
 
 ---
 
-## 9. Rules of Engagement
+## 10. Rules of Engagement
 
 1. **Focus** — Only execute YOUR assigned step. Do NOT attempt to complete the entire investigation or explore tangential leads.
 2. **No Redundancy** — Check the Operation Log carefully. **Do NOT** repeat any command or query already executed by a previous agent. If the data you need is already in the Research Findings, use it directly.
@@ -130,7 +136,7 @@ Before using **any** tool, answer this question internally:
 
 ---
 
-## 10. Operation Log Writing Rules
+## 11. Operation Log Writing Rules
 
 When recording your actions in `my_actions`, follow these rules:
 
@@ -142,7 +148,7 @@ When recording your actions in `my_actions`, follow these rules:
 
 ---
 
-## 11. Output Format
+## 12. Output Format
 
 Your final output must be a **strictly valid JSON object** with exactly two keys:
 
@@ -169,7 +175,7 @@ Your final output must be a **strictly valid JSON object** with exactly two keys
 
 ---
 
-## 12. Critical — Machine Parsing Rules
+## 13. Critical — Machine Parsing Rules
 
 > **Your reply will be parsed directly by `json.Unmarshal`.** Any deviation causes a hard failure.
 
