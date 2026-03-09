@@ -24,6 +24,7 @@ type Session struct {
 	PcapPath        sql.NullString `db:"pcap_path"`
 	FindingsSummary string         `db:"findings_summary"`
 	ReportSummary   string         `db:"report_summary"`
+	Status          string         `db:"status"`
 	CreatedAt       time.Time      `db:"created_at"`
 	UpdatedAt       time.Time      `db:"updated_at"`
 }
@@ -38,6 +39,7 @@ type Round struct {
 	Summary          string    `db:"summary"`
 	KeyFindings      string    `db:"key_findings"`
 	OpenQuestions    string    `db:"open_questions"`
+	MarkdownReport   string    `db:"markdown_report"`
 	Compressed       bool      `db:"compressed"`
 	CreatedAt        time.Time `db:"created_at"`
 }
@@ -49,6 +51,7 @@ type SessionListItem struct {
 	ID         string         `db:"id"`
 	UserQuery  string         `db:"user_query"`
 	RoundCount int            `db:"round_count"`
+	Status     string         `db:"status"`
 	PcapFileID sql.NullInt64  `db:"pcap_file_id"`
 	PcapPath   sql.NullString `db:"pcap_path"`
 	CreatedAt  time.Time      `db:"created_at"`
@@ -84,4 +87,14 @@ type HistorySnapshot struct {
 	CompressedUpTo int       `db:"compressed_up_to"` // round number up to which entries were compressed
 	Content        string    `db:"content"`
 	CreatedAt      time.Time `db:"created_at"`
+}
+
+// SessionEvent stores a single event emitted during a session, for SSE replay.
+type SessionEvent struct {
+	ID        int64     `db:"id"`
+	SessionID string    `db:"session_id"`
+	Seq       int       `db:"seq"`
+	EventType string    `db:"event_type"`
+	Data      string    `db:"data"`
+	CreatedAt time.Time `db:"created_at"`
 }

@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS rounds (
     summary           TEXT NOT NULL DEFAULT '',
     key_findings      TEXT NOT NULL DEFAULT '',
     open_questions    TEXT NOT NULL DEFAULT '',
+    markdown_report   TEXT NOT NULL DEFAULT '',
     compressed        INTEGER NOT NULL DEFAULT 0,
     created_at        DATETIME NOT NULL DEFAULT (datetime('now')),
     UNIQUE(session_id, round)
@@ -66,6 +67,22 @@ CREATE TABLE IF NOT EXISTS history_snapshots (
     created_at       DATETIME NOT NULL DEFAULT (datetime('now')),
     UNIQUE(session_id, scope)
 );
+
+CREATE TABLE IF NOT EXISTS session_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    seq        INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    data       TEXT NOT NULL DEFAULT '{}',
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(session_id, seq)
+);
+`
+
+// migrations runs idempotent schema migrations for columns added after the initial DDL.
+const migrations = `
+ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'idle';
+ALTER TABLE rounds ADD COLUMN markdown_report TEXT NOT NULL DEFAULT '';
 `
 
 // New opens (or creates) the SQLite database at path and initialises the schema.
@@ -81,6 +98,13 @@ func New(path string) (*Store, error) {
 	if _, err := db.Exec(ddl); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
+	}
+	// Run idempotent migrations (ignore "duplicate column" errors).
+	for _, stmt := range strings.Split(migrations, ";") {
+		stmt = strings.TrimSpace(stmt)
+		if stmt != "" {
+			_, _ = db.Exec(stmt)
+		}
 	}
 	return &Store{db: db}, nil
 }
@@ -125,6 +149,16 @@ func (s *Store) GetPcapFileData(ctx context.Context, id int64) ([]byte, error) {
 		return nil, fmt.Errorf("get pcap data: %w", err)
 	}
 	return data, nil
+}
+
+// GetPcapFilename returns the original filename for a stored pcap file.
+func (s *Store) GetPcapFilename(ctx context.Context, id int64) (string, error) {
+	var name string
+	if err := s.db.QueryRowxContext(ctx,
+		`SELECT filename FROM pcap_files WHERE id = ?`, id).Scan(&name); err != nil {
+		return "", fmt.Errorf("get pcap filename: %w", err)
+	}
+	return name, nil
 }
 
 // ListPcapFiles returns metadata for all stored pcap files (no blob data).
@@ -172,7 +206,7 @@ func (s *Store) CreateSession(ctx context.Context, sess Session) error {
 func (s *Store) GetSession(ctx context.Context, id string) (*Session, error) {
 	var sess Session
 	if err := s.db.GetContext(ctx, &sess,
-		`SELECT id, user_query, pcap_file_id, pcap_path, findings_summary, report_summary, created_at, updated_at
+		`SELECT id, user_query, pcap_file_id, pcap_path, findings_summary, report_summary, status, created_at, updated_at
 		 FROM sessions WHERE id = ?`, id); err != nil {
 		return nil, fmt.Errorf("get session: %w", err)
 	}
@@ -183,7 +217,7 @@ func (s *Store) GetSession(ctx context.Context, id string) (*Session, error) {
 func (s *Store) ListSessions(ctx context.Context) ([]SessionListItem, error) {
 	var items []SessionListItem
 	if err := s.db.SelectContext(ctx, &items, `
-		SELECT s.id, s.user_query, s.pcap_file_id, s.pcap_path,
+		SELECT s.id, s.user_query, s.status, s.pcap_file_id, s.pcap_path,
 		       s.created_at, s.updated_at,
 		       COALESCE(r.cnt, 0) AS round_count
 		FROM sessions s
@@ -222,6 +256,26 @@ func (s *Store) TouchSession(ctx context.Context, id string) error {
 	return nil
 }
 
+// UpdateSessionPcap re-attaches a pcap file to a session by pcap_file_id.
+// Pass 0 to clear the pcap reference and use pcapPath instead.
+func (s *Store) UpdateSessionPcap(ctx context.Context, sessionID string, pcapFileID int64, pcapPath string) error {
+	now := time.Now().UTC()
+	var err error
+	if pcapFileID > 0 {
+		_, err = s.db.ExecContext(ctx,
+			`UPDATE sessions SET pcap_file_id = ?, pcap_path = NULL, updated_at = ? WHERE id = ?`,
+			pcapFileID, now, sessionID)
+	} else {
+		_, err = s.db.ExecContext(ctx,
+			`UPDATE sessions SET pcap_file_id = NULL, pcap_path = ?, updated_at = ? WHERE id = ?`,
+			pcapPath, now, sessionID)
+	}
+	if err != nil {
+		return fmt.Errorf("update session pcap: %w", err)
+	}
+	return nil
+}
+
 // ===================================================================
 // Rounds
 // ===================================================================
@@ -230,10 +284,10 @@ func (s *Store) TouchSession(ctx context.Context, id string) error {
 func (s *Store) SaveRound(ctx context.Context, sessionID string, r Round) error {
 	now := time.Now().UTC()
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO rounds (session_id, round, research_findings, operation_log, summary, key_findings, open_questions, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO rounds (session_id, round, research_findings, operation_log, summary, key_findings, open_questions, markdown_report, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sessionID, r.Round, r.ResearchFindings, r.OperationLog,
-		r.Summary, r.KeyFindings, r.OpenQuestions, now)
+		r.Summary, r.KeyFindings, r.OpenQuestions, r.MarkdownReport, now)
 	if err != nil {
 		return fmt.Errorf("save round: %w", err)
 	}
@@ -255,7 +309,7 @@ func (s *Store) LoadHistory(ctx context.Context, sessionID string) (*common.Sess
 	// 2. Load all non-compressed rounds, ordered by round number.
 	var rounds []Round
 	if err := s.db.SelectContext(ctx, &rounds,
-		`SELECT round, research_findings, operation_log, summary, key_findings, open_questions
+		`SELECT round, research_findings, operation_log, summary, key_findings, open_questions, markdown_report
 		 FROM rounds WHERE session_id = ? AND compressed = 0 ORDER BY round ASC`, sessionID); err != nil {
 		return nil, fmt.Errorf("load rounds: %w", err)
 	}
@@ -375,10 +429,72 @@ func (s *Store) LoadSnapshot(ctx context.Context, sessionID, scope string) (*His
 func (s *Store) LoadRoundsAfter(ctx context.Context, sessionID string, afterRound int) ([]Round, error) {
 	var rounds []Round
 	if err := s.db.SelectContext(ctx, &rounds,
-		`SELECT round, research_findings, operation_log, summary, key_findings, open_questions
+		`SELECT round, research_findings, operation_log, summary, key_findings, open_questions, markdown_report
 		 FROM rounds WHERE session_id = ? AND round > ? ORDER BY round ASC`,
 		sessionID, afterRound); err != nil {
 		return nil, fmt.Errorf("load rounds after %d: %w", afterRound, err)
+	}
+	return rounds, nil
+}
+
+// ===================================================================
+// Session Events (for SSE replay)
+// ===================================================================
+
+// SaveEvent stores a single event for a session with monotonic sequence number.
+func (s *Store) SaveEvent(ctx context.Context, sessionID string, seq int, eventType, data string) error {
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO session_events (session_id, seq, event_type, data, created_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		sessionID, seq, eventType, data, now)
+	if err != nil {
+		return fmt.Errorf("save event: %w", err)
+	}
+	return nil
+}
+
+// LoadSessionEvents returns all events for a session, ordered by seq.
+func (s *Store) LoadSessionEvents(ctx context.Context, sessionID string) ([]SessionEvent, error) {
+	var evts []SessionEvent
+	if err := s.db.SelectContext(ctx, &evts,
+		`SELECT id, session_id, seq, event_type, data, created_at
+		 FROM session_events WHERE session_id = ? ORDER BY seq ASC`, sessionID); err != nil {
+		return nil, fmt.Errorf("load session events: %w", err)
+	}
+	return evts, nil
+}
+
+// LoadSessionEventsSince returns events with seq > afterSeq.
+func (s *Store) LoadSessionEventsSince(ctx context.Context, sessionID string, afterSeq int) ([]SessionEvent, error) {
+	var evts []SessionEvent
+	if err := s.db.SelectContext(ctx, &evts,
+		`SELECT id, session_id, seq, event_type, data, created_at
+		 FROM session_events WHERE session_id = ? AND seq > ? ORDER BY seq ASC`,
+		sessionID, afterSeq); err != nil {
+		return nil, fmt.Errorf("load events since seq %d: %w", afterSeq, err)
+	}
+	return evts, nil
+}
+
+// UpdateSessionStatus sets the status field for a session.
+func (s *Store) UpdateSessionStatus(ctx context.Context, sessionID, status string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE sessions SET status = ?, updated_at = ? WHERE id = ?`,
+		status, time.Now().UTC(), sessionID)
+	if err != nil {
+		return fmt.Errorf("update session status: %w", err)
+	}
+	return nil
+}
+
+// LoadRounds returns all rounds for a session, ordered by round number.
+func (s *Store) LoadRounds(ctx context.Context, sessionID string) ([]Round, error) {
+	var rounds []Round
+	if err := s.db.SelectContext(ctx, &rounds,
+		`SELECT id, session_id, round, research_findings, operation_log, summary, key_findings, open_questions, markdown_report, compressed, created_at
+		 FROM rounds WHERE session_id = ? ORDER BY round ASC`, sessionID); err != nil {
+		return nil, fmt.Errorf("load rounds: %w", err)
 	}
 	return rounds, nil
 }

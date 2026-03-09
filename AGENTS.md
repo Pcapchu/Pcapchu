@@ -13,6 +13,7 @@ For a human-friendly overview, see [README.md](./README.md).
   - [ReAct Agent Loop (Eino)](#react-agent-loop-eino)
   - [Multi-Agent Pipeline](#multi-agent-pipeline)
   - [Event System](#event-system)
+  - [HTTP SSE Server](#http-sse-server)
 - [Project Structure](#project-structure)
 - [Build & Run](#build--run)
 - [Environment Variables](#environment-variables)
@@ -47,16 +48,18 @@ Multiple investigation rounds can be executed, each building on the previous rou
 +--------+     +------------------+     +-------------------------+
 |  User  |---->|  CLI (cobra)     |---->|  Runtime Bootstrap      |
 +--------+     |  cmd/main.go     |     |  internal/cli/          |
-               |  internal/cli/   |     |  - LLM client (OpenAI)  |
-               +------------------+     |  - Docker sandbox       |
-                                        |  - Logger + OTel        |
-                                        |  - Event emitter        |
-                                        +-----------+-------------+
-                                                    |
-                                                    v
-                                  +-----------------+------------------+
-                                  |        Investigation Loop          |
-                                  |  (per round, per session)          |
+   |           |  internal/cli/   |     |  - LLM client (OpenAI)  |
+   |           +------------------+     |  - Docker sandbox       |
+   |                                    |  - Logger + OTel        |
+   |                                    |  - Event emitter        |
+   |                                    +-----------+-------------+
+   |                                                |
+   |  +------------------+                          v
+   +->|  HTTP Server     |     +-----------------+------------------+
+      |  internal/server/ |     |        Investigation Loop          |
+      |  - SSE streaming  |---->|  internal/investigation/           |
+      |  - REST API       |     |  (per round, per session)          |
+      +------------------+
                                   |                                    |
                                   |  +----------+     +------------+  |
                                   |  | Planner  |---->| Executor   |  |
@@ -208,6 +211,9 @@ info                error
 
 Subscribers receive `Event{Type, SessionID, Timestamp, Data}` via channel.
 
+In **server mode**, events are also persisted to `session_events` table with
+monotonic sequence numbers for SSE replay and reconnection support.
+
 Event data payloads (decoded from `Data json.RawMessage` based on `Type`):
 
 | Event Type | Data Struct | Key Fields |
@@ -218,16 +224,62 @@ Event data payloads (decoded from `Data json.RawMessage` based on `Type`):
 | `analysis.completed` | `AnalysisData` | SessionID, TotalRounds |
 | `pcap.loaded` | `PcapLoadedData` | Source, Path, Size, Filename |
 | `round.started` | `RoundStartedData` | Round, TotalRounds |
-| `round.completed` | `RoundCompletedData` | Round, Summary, KeyFindings |
+| `round.completed` | `RoundCompletedData` | Round, Summary, KeyFindings, MarkdownReport |
 | `plan.created` | `PlanCreatedData` | Thought, TotalSteps, Steps |
 | `plan.error` | `ErrorData` | Phase, Message, StepID |
 | `step.started` | `StepStartedData` | StepID, Intent, TotalSteps |
 | `step.findings` | `StepFindingsData` | StepID, Intent, Findings, Actions |
 | `step.completed` | `StepCompletedData` | StepID, TotalSteps |
 | `step.error` | `ErrorData` | Phase, Message, StepID |
-| `report.generated` | `ReportData` | Round, Report, ContentLen, TotalSteps, DurationMs |
+| `report.generated` | `ReportData` | Round, Report, MarkdownReport, ContentLen, TotalSteps, DurationMs |
 | `info` | `InfoData` | Message |
 | `error` | `ErrorData` | Phase, Message, StepID |
+
+### HTTP SSE Server
+
+The HTTP server (`internal/server/`) provides a REST + SSE API for web frontends.
+Full API documentation: [`internal/server/API.md`](./internal/server/API.md).
+
+```
+   Frontend (browser)
+       │
+       ├── POST /api/analyze       → Start new investigation
+       ├── GET  /api/sessions/{id}/stream  → SSE event stream
+       ├── POST /api/sessions/{id}/cancel  → Cancel active investigation
+       ├── GET  /api/sessions      → List sessions
+       └── POST /api/pcap/upload   → Upload pcap files
+              │
+              ▼
+   ┌──────────────────────────────────────────┐
+   │  Server (internal/server/)               │
+   │                                          │
+   │  ┌─────────┐    ┌────────────────────┐   │
+   │  │ Router  │───>│ Runner             │   │
+   │  │ (mux)   │    │ - per-session ctx  │   │
+   │  └─────────┘    │ - Docker sandbox   │   │
+   │                 │ - event broadcast  │   │
+   │                 │ - DB persistence   │   │
+   │                 └────────┬───────────┘   │
+   │                          │               │
+   │                          ▼               │
+   │            investigation.RunInvestigation│
+   │                          │               │
+   │                          ▼               │
+   │              SSE clients ← broadcast     │
+   │              session_events ← persist    │
+   └──────────────────────────────────────────┘
+```
+
+Key design:
+- **Investigation outlives HTTP request** — `runner.Start()` uses
+  `context.Background()`. The POST returns immediately with session ID.
+- **SSE = observation window** — `/stream` does not control the investigation
+  lifecycle. Multiple clients can connect. Reconnect with `Last-Event-ID`.
+- **Cancel = explicit** — `POST /sessions/{id}/cancel` cancels the context.
+- **Cleanup guaranteed** — Docker sandbox `env.Cleanup()` runs via `defer`
+  in the investigation goroutine (success, error, or cancel).
+- **Event replay** — all events persisted to `session_events` with monotonic
+  seq. Reconnecting replays from DB, then continues live.
 
 ---
 
@@ -240,8 +292,9 @@ Pcapchu/
 |-- internal/
 |   |-- cli/                       # CLI layer (cobra commands + runtime)
 |   |   |-- root.go                #   Root command, Execute(), --db flag
-|   |   |-- runtime.go             #   Runtime bootstrap, investigation loop, ReAct factory
+|   |   |-- runtime.go             #   Runtime bootstrap (newRuntime, Close)
 |   |   |-- analyze.go             #   "analyze" subcommand, resumeSession()
+|   |   |-- serve.go               #   "serve" subcommand (HTTP SSE server)
 |   |   |-- session.go             #   "session list/resume/delete"
 |   |   `-- pcap.go                #   "pcap list/delete"
 |   |-- common/
@@ -251,6 +304,8 @@ Pcapchu/
 |   |   `-- events.go              #   ChannelEmitter, event types, subscriber channels
 |   |-- executor/
 |   |   `-- executor.go            #   Executor graph (normal + final step pipeline)
+|   |-- investigation/
+|   |   `-- investigation.go       #   RunInvestigation, CopyPcapToContainer, NewReActAgent
 |   |-- planner/
 |   |   `-- planner.go             #   Planner graph (prompt + ReAct + JSON parse)
 |   |-- prompts/
@@ -261,9 +316,18 @@ Pcapchu/
 |   |   |-- analyzer_introduction.md  # Shared sandbox context
 |   |   |-- sum.md                 #   Conversation summarizer prompt
 |   |   `-- sum_report.md          #   Report summarizer prompt (history compression)
+|   |-- server/                    # HTTP SSE API server
+|   |   |-- API.md                 #   Full API documentation
+|   |   |-- server.go              #   Server struct, routes, CORS, ListenAndServe
+|   |   |-- sse.go                 #   SSE writer helper (writeEvent, writeComment)
+|   |   |-- runner.go              #   Runner: per-session investigation goroutines
+|   |   |-- handler_analyze.go     #   POST /api/analyze, continue, cancel
+|   |   |-- handler_stream.go      #   GET /api/sessions/{id}/stream (SSE), events
+|   |   |-- handler_session.go     #   GET/DELETE /api/sessions
+|   |   `-- handler_pcap.go        #   POST/GET/DELETE /api/pcap, PATCH pcap reattach
 |   `-- storage/
-|       |-- models.go              #   PcapFile, Session, Round, list item models
-|       `-- store.go               #   SQLite CRUD (sqlx), schema DDL
+|       |-- models.go              #   PcapFile, Session, Round, SessionEvent models
+|       `-- store.go               #   SQLite CRUD (sqlx), schema DDL, migrations
 |-- middlewares/
 |   |-- logger/
 |   |   |-- logger.go              #   Log interface, Logger struct, Emit()
@@ -326,7 +390,7 @@ go vet ./...
 ### Run
 
 ```bash
-# New analysis
+# New analysis (CLI)
 ./pcapchu analyze --pcap capture.pcap --query "Find security threats" --rounds 2
 
 # Store pcap in SQLite
@@ -338,6 +402,9 @@ go vet ./...
 # List sessions / pcap files
 ./pcapchu session list
 ./pcapchu pcap list
+
+# Start HTTP SSE server
+./pcapchu serve --addr :8080
 ```
 
 ### Docker Sandbox Image
@@ -462,17 +529,25 @@ pcap_files (id, filename, size, sha256 UNIQUE, data BLOB, created_at)
 
 -- Investigation sessions
 sessions (id TEXT PK, user_query, pcap_file_id FK -> pcap_files ON DELETE SET NULL,
-          pcap_path, findings_summary, report_summary, created_at, updated_at)
+          pcap_path, findings_summary, report_summary,
+          status TEXT DEFAULT 'idle',
+          created_at, updated_at)
 
 -- Per-round investigation results
 rounds (id, session_id FK -> sessions ON DELETE CASCADE, round,
         research_findings, operation_log, summary, key_findings,
-        open_questions, compressed, created_at, UNIQUE(session_id, round))
+        open_questions, markdown_report, compressed, created_at,
+        UNIQUE(session_id, round))
 
 -- Compressed history snapshots (one per session + scope)
 history_snapshots (id, session_id FK -> sessions ON DELETE CASCADE, scope,
                    compressed_up_to, content, created_at,
                    UNIQUE(session_id, scope))
+
+-- SSE event replay (monotonic seq per session)
+session_events (id, session_id FK -> sessions ON DELETE CASCADE, seq,
+                event_type, data TEXT, created_at,
+                UNIQUE(session_id, seq))
 ```
 
 ---
@@ -485,6 +560,8 @@ history_snapshots (id, session_id FK -> sessions ON DELETE CASCADE, scope,
 - **Logging**: Use `logger.Log` interface. Never use `fmt.Println` for operational output (use structured logging or events).
 - **Sinks**: Console sink truncates long strings (default 2000 chars). OTel sink gets full data. Pretty handler provides colored multi-line output.
 - **CLI**: All terminal-facing logic lives in `internal/cli/`. `cmd/main.go` is a thin wrapper.
+- **Server**: HTTP SSE API in `internal/server/`. API docs in `internal/server/API.md`.
+- **Investigation**: Shared investigation logic in `internal/investigation/` (used by both CLI and server).
 - **Prompts**: Markdown templates in `internal/prompts/`, loaded via Go embed. Template variables use `{{.var_name}}`.
 - **Events**: Typed event constants in `internal/events/events.go`. Emit via `logger.Emit()`.
 - **Storage**: All DB interaction through `internal/storage/Store` methods. Schema migrations in DDL const.

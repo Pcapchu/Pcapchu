@@ -36,3 +36,12 @@ env.sh
 
 # pcapchu-scripts Python artifacts
 pcapchu-scripts
+
+# Frontend (web/)
+web/node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
+
+# Built frontend assets served by Go embed
+internal/server/static/
+!internal/server/static/.gitkeep

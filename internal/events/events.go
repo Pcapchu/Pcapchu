@@ -95,9 +95,10 @@ type RoundStartedData struct {
 }
 
 type RoundCompletedData struct {
-	Round       int    `json:"round"`
-	Summary     string `json:"summary"`
-	KeyFindings string `json:"key_findings"`
+	Round          int    `json:"round"`
+	Summary        string `json:"summary"`
+	KeyFindings    string `json:"key_findings"`
+	MarkdownReport string `json:"markdown_report,omitempty"`
 }
 
 type PlanCreatedData struct {
@@ -130,11 +131,12 @@ type StepCompletedData struct {
 }
 
 type ReportData struct {
-	Round      int    `json:"round"`
-	Report     string `json:"report"`
-	ContentLen int    `json:"content_length"`
-	TotalSteps int    `json:"total_steps"`
-	DurationMs int64  `json:"duration_ms"`
+	Round          int    `json:"round"`
+	Report         string `json:"report"`
+	MarkdownReport string `json:"markdown_report,omitempty"`
+	ContentLen     int    `json:"content_length"`
+	TotalSteps     int    `json:"total_steps"`
+	DurationMs     int64  `json:"duration_ms"`
 }
 
 type ErrorData struct {

@@ -60,17 +60,19 @@ func (f FlexString) String() string {
 
 // RoundSummary is the parsed JSON output from the Final Executor (phased summary).
 type RoundSummary struct {
-	Summary       FlexString `json:"summary"`
-	KeyFindings   FlexString `json:"key_findings"`
-	OpenQuestions  FlexString `json:"open_questions"`
+	Summary        FlexString `json:"summary"`
+	KeyFindings    FlexString `json:"key_findings"`
+	OpenQuestions   FlexString `json:"open_questions"`
+	MarkdownReport FlexString `json:"markdown_report"`
 }
 
 // RoundReport is a completed round summary tagged with its round number.
 type RoundReport struct {
-	Round        int    `json:"round"`
-	Summary      string `json:"summary"`
-	KeyFindings  string `json:"key_findings"`
-	OpenQuestions string `json:"open_questions"`
+	Round          int    `json:"round"`
+	Summary        string `json:"summary"`
+	KeyFindings    string `json:"key_findings"`
+	OpenQuestions   string `json:"open_questions"`
+	MarkdownReport string `json:"markdown_report"`
 }
 
 // SessionHistory holds accumulated context from previous rounds, fed into the next planner.

@@ -65,13 +65,14 @@ These are all findings contributed by every previous Executor Agent:
 
 ## 8. Output Format
 
-Your output must be a **strictly valid JSON object** with exactly three keys:
+Your output must be a **strictly valid JSON object** with exactly four keys:
 
 ```
 {
   "summary": "...",
   "key_findings": "...",
-  "open_questions": "..."
+  "open_questions": "...",
+  "markdown_report": "..."
 }
 ```
 
@@ -80,6 +81,55 @@ Your output must be a **strictly valid JSON object** with exactly three keys:
 | `summary` | Comprehensive synthesis of all findings from this round. Organized logically, citing specific data points (IPs, timestamps, counts, etc.). Write it as if briefing an analyst. |
 | `key_findings` | The most important discoveries — headline results. Bullet points preferred. Include exact values. |
 | `open_questions` | Aspects that remain unclear or warrant further investigation. Empty string `""` if the current query is fully addressed by this round. |
+| `markdown_report` | A polished, human-readable Markdown report. Structure described in Section 8.1 below. |
+
+### 8.1 `markdown_report` Structure
+
+This field is the **primary deliverable** shown directly to the human analyst. Write the full report in Markdown. Follow this template:
+
+```markdown
+### 🎯 Investigation Objectives & Analytical Strategy
+
+**Investigation Objective:**
+<one-paragraph summary of what was investigated>
+
+**Analytical Strategy:**
+<describe which tables / data sources were used and in what order, with reasoning>
+
+---
+
+# 💡 Key Findings and Supporting Evidence
+
+## Finding N: <concise title>
+
+**Assessment:**
+<clear statement of the finding>
+
+**Supporting Evidence and Verification Steps:**
+<cite specific data: table names, filters, counts, IPs, timestamps, code blocks for verification commands/queries>
+
+(repeat for each finding)
+
+---
+
+# 📝 Overall Assessment and Analytical Blind Spots
+
+**Final Conclusion:**
+<one-paragraph synthesis>
+
+---
+
+## Analytical Gaps and Recommended Next Steps
+
+<what remains unknown, and concrete recommendations for further investigation>
+```
+
+Guidelines for `markdown_report`:
+- **Cite every claim** with the exact table, filter expression, or command that produced it.
+- Include **code blocks** for SQL filters, CLI commands, or file paths that let an analyst reproduce results.
+- Use **exact values**: IPs, ports, domains, User-Agent strings, byte counts, timestamps.
+- Keep each Finding self-contained — an analyst should be able to read one Finding and understand it without reading the others.
+- If no significant findings exist for a category, omit that Finding rather than including a placeholder.
 
 ---
 

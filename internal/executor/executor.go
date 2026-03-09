@@ -34,12 +34,13 @@ const (
 
 // Result is the output of a full executor pipeline run.
 type Result struct {
-	Round        int
-	Summary      string
-	KeyFindings  string
-	OpenQuestions string
-	Findings     string
-	OperationLog string
+	Round          int
+	Summary        string
+	KeyFindings    string
+	OpenQuestions   string
+	MarkdownReport string
+	Findings       string
+	OperationLog   string
 }
 
 // Executor wraps the ReAct agent used for normal investigation steps and
@@ -397,21 +398,23 @@ func (e *Executor) Run(ctx context.Context, plan common.Plan, userQuery string, 
 
 	// Emit report event
 	e.log.Emit(events.TypeReportGenerated, events.ReportData{
-		Round:      round,
-		Report:     roundSummary.Summary.String(),
-		ContentLen: len(report),
-		TotalSteps: len(plan.Steps),
+		Round:          round,
+		Report:         roundSummary.Summary.String(),
+		MarkdownReport: roundSummary.MarkdownReport.String(),
+		ContentLen:     len(report),
+		TotalSteps:     len(plan.Steps),
 	})
 
 	// Build result from captured closure state
 	captureMu.Lock()
 	result := &Result{
-		Round:        round,
-		Summary:      roundSummary.Summary.String(),
-		KeyFindings:  roundSummary.KeyFindings.String(),
-		OpenQuestions: roundSummary.OpenQuestions.String(),
-		Findings:     capturedFindings,
-		OperationLog: strings.Join(capturedOpLog, "\n---\n"),
+		Round:          round,
+		Summary:        roundSummary.Summary.String(),
+		KeyFindings:    roundSummary.KeyFindings.String(),
+		OpenQuestions:   roundSummary.OpenQuestions.String(),
+		MarkdownReport: roundSummary.MarkdownReport.String(),
+		Findings:       capturedFindings,
+		OperationLog:   strings.Join(capturedOpLog, "\n---\n"),
 	}
 	captureMu.Unlock()
 

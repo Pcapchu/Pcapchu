@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/Pcapchu/Pcapchu/internal/events"
+	"github.com/Pcapchu/Pcapchu/internal/investigation"
 	"github.com/Pcapchu/Pcapchu/internal/storage"
 	"github.com/Pcapchu/Pcapchu/middlewares/logger"
 
@@ -130,7 +131,7 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 		TotalRounds: analyzeRounds,
 	})
 
-	if err := runInvestigation(rt, store, sessionID, analyzeQuery, containerPcapPath, 1, analyzeRounds); err != nil {
+	if err := investigation.RunInvestigation(rt.ctx, rt.log, rt.planner, rt.exec, rt.compressor, store, sessionID, analyzeQuery, containerPcapPath, 1, analyzeRounds); err != nil {
 		return err
 	}
 
@@ -161,7 +162,7 @@ func resumeSession(store *storage.Store, sessionID, queryOverride string, rounds
 		query = queryOverride
 	}
 
-	containerPcapPath, err := copyPcapToContainer(rt.ctx, rt.env, sess, store, "")
+	containerPcapPath, err := investigation.CopyPcapToContainer(rt.ctx, rt.env, sess, store, "")
 	if err != nil {
 		return fmt.Errorf("load pcap into container: %w", err)
 	}
@@ -184,7 +185,7 @@ func resumeSession(store *storage.Store, sessionID, queryOverride string, rounds
 		TotalRounds: endRound,
 	})
 
-	if err := runInvestigation(rt, store, sessionID, query, containerPcapPath, startRound, endRound); err != nil {
+	if err := investigation.RunInvestigation(rt.ctx, rt.log, rt.planner, rt.exec, rt.compressor, store, sessionID, query, containerPcapPath, startRound, endRound); err != nil {
 		return err
 	}
 
