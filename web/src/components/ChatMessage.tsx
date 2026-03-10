@@ -8,7 +8,8 @@ import { ErrorMessage } from "./messages/ErrorMessage";
 import { RoundMessage } from "./messages/RoundMessage";
 
 /** Renders a single SSE event as the appropriate chat message component. */
-export function ChatMessage({ event }: { event: SSEEvent }) {
+export function ChatMessage({ event, completedStepIds }: { event: SSEEvent; completedStepIds?: Set<number> }) {
+  const completed = completedStepIds ?? new Set<number>();
   switch (event.type) {
     case "session.created":
       return <UserQueryMessage data={event.data} />;
@@ -47,12 +48,12 @@ export function ChatMessage({ event }: { event: SSEEvent }) {
       return <RoundMessage type="end" data={event.data} />;
 
     case "plan.created":
-      return <PlanMessage data={event.data} />;
+      return <PlanMessage data={event.data} completedStepIds={completed} />;
 
     case "step.started":
     case "step.findings":
     case "step.completed":
-      return <StepMessage type={event.type} data={event.data} />;
+      return <StepMessage type={event.type} data={event.data} completedStepIds={completed} />;
 
     case "report.generated":
       return <ReportMessage data={event.data} />;

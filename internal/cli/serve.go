@@ -42,7 +42,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	log := logger.NewLogger().WithSink(logger.NewPrettyConsoleSink())
+	log, otelShutdown, _ := logger.NewDefaultLogger(ctx, "pcapchu")
+	if otelShutdown != nil {
+		defer otelShutdown(context.Background())
+	}
 
 	srv := server.New(store, log, serveAddr)
 	return srv.ListenAndServe(ctx)

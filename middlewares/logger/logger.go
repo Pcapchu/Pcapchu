@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+
+	"go.opentelemetry.io/otel"
 )
 
 // ANSI colour escapes used by Tokenf.
@@ -135,6 +137,34 @@ func (l *Logger) RecordMetric(ctx context.Context, name string, value float64, a
 
 func (l *Logger) Flush(ctx context.Context) {
 	l.Sink().Flush(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// NewDefaultLogger — one-call setup (console + optional OTel)
+// ---------------------------------------------------------------------------
+
+// NewDefaultLogger creates a Logger with PrettyConsoleSink and, if the
+// OTEL_EXPORTER_OTLP_ENDPOINT env var is set, an OTel sink.
+// The returned shutdown function flushes OTel providers (nil-safe).
+func NewDefaultLogger(ctx context.Context, serviceName string) (*Logger, func(context.Context), error) {
+	l := NewLogger().WithSink(NewPrettyConsoleSink())
+
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		l.Warn(ctx, "[OTel] internal error", A(AttrError, err.Error()))
+	}))
+
+	var shutdown func(context.Context)
+	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" {
+		res, err := InitOTel(ctx, serviceName)
+		if err != nil {
+			l.Error(ctx, "otel init failed", A(AttrError, err.Error()))
+		} else {
+			l.WithSink(NewOTelSink(res.Tracer(serviceName), res.Meter(serviceName), res.Logger(serviceName)))
+			shutdown = func(ctx context.Context) { _ = res.Shutdown(ctx) }
+		}
+	}
+
+	return l, shutdown, nil
 }
 
 // ---------------------------------------------------------------------------

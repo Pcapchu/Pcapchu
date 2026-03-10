@@ -29,10 +29,6 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 		if status == "" {
 			status = "idle"
 		}
-		// If the runner thinks it's active, override the DB status.
-		if s.runner.IsRunning(item.ID) {
-			status = "running"
-		}
 		result = append(result, sessionJSON{
 			ID:         item.ID,
 			UserQuery:  item.UserQuery,
@@ -90,9 +86,6 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	if status == "" {
 		status = "idle"
 	}
-	if s.runner.IsRunning(sessionID) {
-		status = "running"
-	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":          sess.ID,
@@ -108,9 +101,6 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 // handleDeleteSession deletes a session and all its data.
 func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("id")
-
-	// Cancel if currently running.
-	s.runner.Cancel(sessionID)
 
 	if err := s.store.DeleteSession(r.Context(), sessionID); err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)

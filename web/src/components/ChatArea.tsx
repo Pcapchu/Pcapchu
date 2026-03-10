@@ -1,21 +1,59 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useMemo } from "react";
 import { Layers, Loader2 } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ChatMessage } from "@/components/ChatMessage";
-import type { SSEEvent } from "@/lib/types";
+import { useStore } from "@/lib/store";
 
-interface ChatAreaProps {
-  events: SSEEvent[];
-  loading?: boolean;
-  sessionActive?: boolean;
-}
+const emptySet = new Set<number>();
 
-export function ChatArea({ events, loading, sessionActive }: ChatAreaProps) {
+export function ChatArea() {
+  const events = useStore((s) => s.events);
+  const loading = useStore((s) => s.loading);
+  const sessionActive = useStore((s) => s.sessionActive);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [events.length]);
+
+  // Derive per-round completed step ID sets + per-event round assignment.
+  const { eventRounds, completedByRound } = useMemo(() => {
+    // Map from round number → set of completed step IDs
+    const completed = new Map<number, Set<number>>();
+    // Map from round number → set of all seen step IDs (for round.completed flush)
+    const seenByRound = new Map<number, Set<number>>();
+    // Round assignment for each event index
+    const rounds: number[] = [];
+    let currentRound = 0;
+
+    for (const ev of events) {
+      if (ev.type === "round.started") {
+        currentRound = Number(ev.data.round || 0);
+      }
+      rounds.push(currentRound);
+
+      if (ev.type === "step.started" || ev.type === "step.findings") {
+        const stepId = Number(ev.data.step_id || 0);
+        if (!seenByRound.has(currentRound)) seenByRound.set(currentRound, new Set());
+        seenByRound.get(currentRound)!.add(stepId);
+      } else if (ev.type === "step.completed") {
+        const stepId = Number(ev.data.step_id || 0);
+        if (!completed.has(currentRound)) completed.set(currentRound, new Set());
+        completed.get(currentRound)!.add(stepId);
+      } else if (ev.type === "round.completed") {
+        const round = Number(ev.data.round || currentRound);
+        // Mark all steps in this round as completed
+        const seen = seenByRound.get(round);
+        if (seen) {
+          if (!completed.has(round)) completed.set(round, new Set());
+          const set = completed.get(round)!;
+          for (const id of seen) set.add(id);
+        }
+      }
+    }
+
+    return { eventRounds: rounds, completedByRound: completed };
+  }, [events]);
 
   // Empty state — welcome screen
   if (events.length === 0 && !loading) {
@@ -39,7 +77,11 @@ export function ChatArea({ events, loading, sessionActive }: ChatAreaProps) {
     <ScrollArea className="flex-1">
       <div className="mx-auto max-w-3xl py-4 space-y-1">
         {events.map((ev, i) => (
-          <ChatMessage key={i} event={ev} />
+          <ChatMessage
+            key={i}
+            event={ev}
+            completedStepIds={completedByRound.get(eventRounds[i]) ?? emptySet}
+          />
         ))}
 
         {/* Loading indicator while investigation is running */}

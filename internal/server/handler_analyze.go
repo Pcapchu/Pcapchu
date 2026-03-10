@@ -3,171 +3,47 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"io"
+	"fmt"
 	"net/http"
-	"strconv"
+	"time"
 
 	"github.com/Pcapchu/Pcapchu/internal/events"
-	"github.com/Pcapchu/Pcapchu/internal/storage"
-
-	"github.com/google/uuid"
+	"github.com/Pcapchu/Pcapchu/internal/investigation"
+	"github.com/Pcapchu/Pcapchu/middlewares/logger"
 )
 
-// analyzeRequest is the JSON body for POST /api/analyze when not using multipart.
+// analyzeRequest is the JSON body for POST /api/sessions/{id}/analyze.
 type analyzeRequest struct {
-	PcapID   int64  `json:"pcap_id,omitempty"`
-	Query    string `json:"query"`
-	Rounds   int    `json:"rounds"`
-	StorePcap bool  `json:"store_pcap,omitempty"`
+	Query string `json:"query"`
 }
 
-// continueRequest is the JSON body for POST /api/sessions/{id}/continue.
-type continueRequest struct {
-	Query  string `json:"query"`
-	Rounds int    `json:"rounds"`
-}
-
-// handleAnalyze starts a new analysis session.
+// handleAnalyze runs one investigation round on an existing session and streams
+// events via SSE. The session must already have a pcap attached (via
+// POST /api/pcap/upload or PATCH /api/sessions/{id}/pcap).
+// Call this endpoint repeatedly to run additional rounds — the start round is
+// auto-detected from the database.
 //
-// Accepts multipart/form-data with fields:
-//
-//	pcap (file)       — pcap file upload
-//	pcap_id (string)  — OR reference a stored pcap by ID
-//	query (string)    — analysis query
-//	rounds (string)   — number of rounds (default "1")
-//	store_pcap (string) — "true" to persist pcap in DB
-//
-// Returns 201 with {"session_id": "...", "status": "running"}.
+// Request: POST /api/sessions/{id}/analyze  {"query":"..."}
+// Response: text/event-stream
 func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	query := "Analyze this pcap file and identify any security concerns."
-	rounds := 1
-	var pcapID int64
-	var pcapData []byte
-	var pcapFilename string
-
-	ct := r.Header.Get("Content-Type")
-	if len(ct) >= 19 && ct[:19] == "multipart/form-data" {
-		// Limit upload to 500 MB.
-		if err := r.ParseMultipartForm(500 << 20); err != nil {
-			http.Error(w, "parse multipart: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		if q := r.FormValue("query"); q != "" {
-			query = q
-		}
-		if n, err := strconv.Atoi(r.FormValue("rounds")); err == nil && n > 0 {
-			rounds = n
-		}
-		if pidStr := r.FormValue("pcap_id"); pidStr != "" {
-			if pid, err := strconv.ParseInt(pidStr, 10, 64); err == nil {
-				pcapID = pid
-			}
-		}
-
-		file, header, err := r.FormFile("pcap")
-		if err == nil {
-			defer file.Close()
-			data, err := io.ReadAll(file)
-			if err != nil {
-				http.Error(w, "read pcap upload: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-			pcapData = data
-			pcapFilename = header.Filename
-		}
-	} else {
-		// JSON body
-		var req analyzeRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-		if req.Query != "" {
-			query = req.Query
-		}
-		if req.Rounds > 0 {
-			rounds = req.Rounds
-		}
-		pcapID = req.PcapID
-	}
-
-	if pcapData == nil && pcapID == 0 {
-		http.Error(w, "either upload a pcap file or provide pcap_id", http.StatusBadRequest)
-		return
-	}
-
-	sessionID := uuid.New().String()
-	var sess storage.Session
-	sess.ID = sessionID
-	sess.UserQuery = query
-
-	if pcapData != nil {
-		// Always store uploaded pcap in DB so the runner can read it
-		// without relying on temporary files.
-		if pcapFilename == "" {
-			pcapFilename = "upload.pcap"
-		}
-		pid, err := s.store.InsertPcapFile(ctx, pcapFilename, pcapData)
-		if err != nil {
-			http.Error(w, "store pcap: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		sess.PcapFileID = storage.NullInt64(pid)
-	} else if pcapID > 0 {
-		sess.PcapFileID = storage.NullInt64(pcapID)
-	}
-
-	if err := s.store.CreateSession(ctx, sess); err != nil {
-		http.Error(w, "create session: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Emit session created event through the runner once it starts,
-	// but also store it immediately so SSE replay can pick it up.
-	ev := events.NewEvent(events.TypeSessionCreated, sessionID, events.SessionCreatedData{
-		SessionID:  sessionID,
-		UserQuery:  query,
-		PcapSource: pcapSourceLabel(sess),
-	})
-	_ = s.store.SaveEvent(ctx, sessionID, 0, ev.Type, string(ev.Data))
-
-	// Use Background context — the investigation must outlive this HTTP request.
-	if err := s.runner.Start(context.Background(), sessionID, query, "", 1, rounds); err != nil {
-		http.Error(w, err.Error(), http.StatusConflict)
-		return
-	}
-
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"session_id": sessionID,
-		"status":     "running",
-	})
-}
-
-// handleContinue adds more investigation rounds to an existing session.
-func (s *Server) handleContinue(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	sessionID := r.PathValue("id")
 
-	if s.runner.IsRunning(sessionID) {
-		http.Error(w, "session is already running", http.StatusConflict)
-		return
-	}
-
-	var req continueRequest
+	var req analyzeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if req.Rounds <= 0 {
-		req.Rounds = 1
-	}
 
+	// Load session, verify it exists and has a pcap.
 	sess, err := s.store.GetSession(ctx, sessionID)
 	if err != nil {
 		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+
+	if !sess.PcapFileID.Valid {
+		http.Error(w, "session has no pcap file attached", http.StatusBadRequest)
 		return
 	}
 
@@ -176,50 +52,130 @@ func (s *Server) handleContinue(w http.ResponseWriter, r *http.Request) {
 		query = req.Query
 	}
 
+	// Determine start/end rounds (auto-detect first-run vs continuation).
 	prevRounds, err := s.store.RoundCount(ctx, sessionID)
 	if err != nil {
 		http.Error(w, "count rounds: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	startRound := prevRounds + 1
-	endRound := startRound + req.Rounds - 1
+	endRound := startRound // always 1 round per request
 
-	// Use Background context — the investigation must outlive this HTTP request.
-	if err := s.runner.Start(context.Background(), sessionID, query, "", startRound, endRound); err != nil {
-		http.Error(w, err.Error(), http.StatusConflict)
+	// --- SSE setup ---
+	sse := newSSEWriter(w)
+	if sse == nil {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"session_id":  sessionID,
-		"status":      "running",
-		"start_round": startRound,
-		"end_round":   endRound,
-	})
-}
+	// Create per-request emitter + logger with emitFunc wired.
+	emitter := events.NewChannelEmitter(1024)
+	log := logger.NewLogger().
+		WithSink(s.log.Sink()).
+		WithEmit(func(eventType string, data any) {
+			emitter.Emit(events.NewEvent(eventType, "", data))
+		})
 
-// handleCancel cancels an active investigation.
-func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
-	sessionID := r.PathValue("id")
-	if !s.runner.Cancel(sessionID) {
-		http.Error(w, "session is not running", http.StatusNotFound)
+	rt, err := investigation.NewRuntime(r.Context(), log, emitter)
+	if err != nil {
+		sseError(sse, "init", fmt.Sprintf("create runtime: %v", err))
 		return
 	}
-	_ = s.store.UpdateSessionStatus(r.Context(), sessionID, "cancelled")
-	writeJSON(w, http.StatusOK, map[string]any{
-		"session_id": sessionID,
-		"status":     "cancelled",
-	})
+	defer rt.Close()
+
+	_ = s.store.UpdateSessionStatus(ctx, sessionID, "running")
+
+	// Save the user query on first analysis so it appears in session listings.
+	if prevRounds == 0 && query != "" {
+		_ = s.store.UpdateSessionQuery(ctx, sessionID, query)
+	}
+
+	// Emit session lifecycle event.
+	if prevRounds == 0 {
+		log.Emit(events.TypeSessionCreated, events.SessionCreatedData{
+			SessionID:  sessionID,
+			UserQuery:  query,
+			PcapSource: "db",
+		})
+	} else {
+		log.Emit(events.TypeSessionResumed, events.SessionResumedData{
+			SessionID: sessionID,
+			FromRound: startRound,
+		})
+	}
+
+	// Copy pcap into container from DB.
+	containerPcapPath, err := investigation.CopyPcapToContainer(rt.Ctx(), rt.Env(), sess, s.store, "")
+	if err != nil {
+		sseError(sse, "init", fmt.Sprintf("copy pcap: %v", err))
+		_ = s.store.UpdateSessionStatus(ctx, sessionID, "error")
+		return
+	}
+
+	// Subscribe to events from the runtime's emitter.
+	ch := rt.Emitter().Subscribe()
+
+	// Run investigation in a goroutine; signal completion via channel.
+	errCh := make(chan error, 1)
+	go func() {
+		err := investigation.RunInvestigation(
+			rt.Ctx(), rt.Log(), rt.Planner(), rt.Exec(), rt.Compressor(),
+			s.store, sessionID, query, containerPcapPath, startRound, endRound,
+		)
+		rt.Emitter().Close() // closes subscriber channels
+		errCh <- err
+	}()
+
+	// Stream events to SSE + persist to DB.
+	seq := 0
+	keepAlive := time.NewTicker(15 * time.Second)
+	defer keepAlive.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			_ = s.store.UpdateSessionStatus(context.Background(), sessionID, "cancelled")
+			return
+		case <-keepAlive.C:
+			sse.writeComment("keepalive")
+		case ev, ok := <-ch:
+			if !ok {
+				runErr := <-errCh
+				status := "completed"
+				if runErr != nil {
+					status = "error"
+					sseError(sse, "investigation", runErr.Error())
+				}
+				// Emit analysis.completed before closing.
+				seq++
+				acData := marshalJSON(events.AnalysisData{
+					SessionID:   sessionID,
+					TotalRounds: endRound,
+				})
+				_ = s.store.SaveEvent(context.Background(), sessionID, seq, events.TypeAnalysisCompleted, acData)
+				sse.writeEvent(seq, events.TypeAnalysisCompleted, acData)
+
+				_ = s.store.UpdateSessionStatus(context.Background(), sessionID, status)
+				sse.writeEvent(0, "done", marshalJSON(map[string]string{
+					"session_id": sessionID,
+					"status":     status,
+				}))
+				return
+			}
+			seq++
+			data := "{}"
+			if ev.Data != nil {
+				data = string(ev.Data)
+			}
+			_ = s.store.SaveEvent(context.Background(), sessionID, seq, ev.Type, data)
+			sse.writeEvent(seq, ev.Type, data)
+		}
+	}
 }
 
-func pcapSourceLabel(sess storage.Session) string {
-	if sess.PcapFileID.Valid {
-		return "db"
-	}
-	if sess.PcapPath.Valid {
-		return sess.PcapPath.String
-	}
-	return "file"
+// sseError sends an error event over the SSE stream.
+func sseError(sse *sseWriter, phase, msg string) {
+	sse.writeEvent(0, "error", marshalJSON(events.ErrorData{Phase: phase, Message: msg}))
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -228,4 +184,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+func marshalJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
 

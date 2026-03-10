@@ -1,10 +1,11 @@
 import type {
-  AnalyzeResponse,
-  ContinueResponse,
+  UploadResponse,
+  ReattachResponse,
   Session,
   SessionDetail,
   PcapFile,
   SSEEvent,
+  EventType,
 } from "./types";
 
 const BASE = "";
@@ -18,73 +19,12 @@ async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-// --- Analysis ---
-
-export async function startAnalysis(
-  pcap: File,
-  query: string,
-  rounds: number
-): Promise<AnalyzeResponse> {
-  const form = new FormData();
-  form.append("pcap", pcap);
-  form.append("query", query);
-  form.append("rounds", String(rounds));
-  form.append("store_pcap", "true");
-  return fetchJSON<AnalyzeResponse>("/api/analyze", {
-    method: "POST",
-    body: form,
-  });
-}
-
-export async function startAnalysisWithPcapId(
-  pcapId: number,
-  query: string,
-  rounds: number
-): Promise<AnalyzeResponse> {
-  return fetchJSON<AnalyzeResponse>("/api/analyze", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ pcap_id: pcapId, query, rounds }),
-  });
-}
-
-export async function continueSession(
-  sessionId: string,
-  query: string,
-  rounds: number
-): Promise<ContinueResponse> {
-  return fetchJSON<ContinueResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/continue`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, rounds }),
-  });
-}
-
-export async function cancelSession(sessionId: string): Promise<void> {
-  await fetch(`${BASE}/api/sessions/${encodeURIComponent(sessionId)}/cancel`, { method: "POST" });
-}
-
-// --- Sessions ---
-
-export async function listSessions(): Promise<Session[]> {
-  const body = await fetchJSON<{ sessions: Session[] }>("/api/sessions");
-  return body.sessions;
-}
-
-export async function getSession(sessionId: string): Promise<SessionDetail> {
-  return fetchJSON<SessionDetail>(`/api/sessions/${encodeURIComponent(sessionId)}`);
-}
-
-export async function deleteSession(sessionId: string): Promise<void> {
-  await fetch(`${BASE}/api/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
-}
-
 // --- Pcap ---
 
-export async function uploadPcap(file: File): Promise<PcapFile> {
+export async function uploadPcap(file: File): Promise<UploadResponse> {
   const form = new FormData();
   form.append("file", file);
-  return fetchJSON<PcapFile>("/api/pcap/upload", {
+  return fetchJSON<UploadResponse>("/api/pcap/upload", {
     method: "POST",
     body: form,
   });
@@ -99,65 +39,179 @@ export async function deletePcapFile(id: number): Promise<void> {
   await fetch(`${BASE}/api/pcap/${id}`, { method: "DELETE" });
 }
 
-// --- SSE ---
-
-export function subscribeSSE(
+export async function reattachPcap(
   sessionId: string,
-  onEvent: (event: SSEEvent) => void,
-  onDone: () => void,
-  onError?: (err: Event) => void,
-  lastEventId?: number
-): () => void {
-  const url = `${BASE}/api/sessions/${encodeURIComponent(sessionId)}/stream`;
-  const es = new EventSource(url);
+  pcapId: number
+): Promise<ReattachResponse> {
+  return fetchJSON<ReattachResponse>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/pcap`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pcap_id: pcapId }),
+    }
+  );
+}
 
-  // For reconnection with Last-Event-ID, EventSource doesn't support custom
-  // headers directly. We rely on the browser's built-in reconnect mechanism
-  // which sends Last-Event-ID automatically.
+// --- Sessions ---
 
-  const eventTypes = [
-    "session.created",
-    "session.resumed",
-    "analysis.started",
-    "analysis.completed",
-    "pcap.loaded",
-    "round.started",
-    "round.completed",
-    "plan.created",
-    "plan.error",
-    "step.started",
-    "step.findings",
-    "step.completed",
-    "step.error",
-    "report.generated",
-    "info",
-    "error",
-  ];
+export async function listSessions(): Promise<Session[]> {
+  const body = await fetchJSON<{ sessions: Session[] }>("/api/sessions");
+  return body.sessions;
+}
 
-  for (const type of eventTypes) {
-    es.addEventListener(type, (e: MessageEvent) => {
-      const seq = e.lastEventId ? parseInt(e.lastEventId, 10) : 0;
-      if (lastEventId && seq <= lastEventId) return;
-      try {
-        onEvent({
-          seq,
-          type: type as SSEEvent["type"],
-          data: JSON.parse(e.data),
-        });
-      } catch {
-        // ignore parse errors
-      }
-    });
-  }
+export async function getSession(sessionId: string): Promise<SessionDetail> {
+  return fetchJSON<SessionDetail>(
+    `/api/sessions/${encodeURIComponent(sessionId)}`
+  );
+}
 
-  es.addEventListener("done", () => {
-    onDone();
-    es.close();
+export async function deleteSession(sessionId: string): Promise<void> {
+  await fetch(`${BASE}/api/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE",
   });
+}
 
-  es.onerror = (err) => {
-    onError?.(err);
-  };
+// --- Event History ---
 
-  return () => es.close();
+export async function loadSessionEvents(
+  sessionId: string
+): Promise<SSEEvent[]> {
+  const body = await fetchJSON<{
+    session_id: string;
+    events: Array<{
+      seq: number;
+      type: string;
+      data: Record<string, unknown>;
+      timestamp: string;
+    }>;
+  }>(`/api/sessions/${encodeURIComponent(sessionId)}/events`);
+  return body.events.map((e) => ({
+    seq: e.seq,
+    type: e.type as EventType,
+    data: e.data,
+    timestamp: e.timestamp,
+  }));
+}
+
+// --- Analysis (SSE via fetch + ReadableStream) ---
+
+/**
+ * Start or continue an investigation. The response is an SSE stream.
+ * Returns an AbortController that can be used to cancel (closing the
+ * connection triggers server-side cancellation via r.Context().Done()).
+ */
+export function analyzeSession(
+  sessionId: string,
+  query: string,
+  onEvent: (event: SSEEvent) => void,
+  onDone: (status: string) => void,
+  onError: (err: string) => void
+): AbortController {
+  const controller = new AbortController();
+
+  const url = `${BASE}/api/sessions/${encodeURIComponent(sessionId)}/analyze`;
+
+  fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query }),
+    signal: controller.signal,
+  })
+    .then(async (res) => {
+      if (!res.ok) {
+        const text = await res.text();
+        onError(`${res.status}: ${text}`);
+        return;
+      }
+      if (!res.body) {
+        onError("No response body");
+        return;
+      }
+      await readSSEStream(res.body, onEvent, onDone, onError);
+    })
+    .catch((err) => {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        onDone("cancelled");
+        return;
+      }
+      onError(err instanceof Error ? err.message : String(err));
+    });
+
+  return controller;
+}
+
+/**
+ * Parse an SSE stream from a ReadableStream<Uint8Array>.
+ * Handles id:, event:, data: fields per the SSE spec.
+ */
+async function readSSEStream(
+  body: ReadableStream<Uint8Array>,
+  onEvent: (event: SSEEvent) => void,
+  onDone: (status: string) => void,
+  onError: (err: string) => void
+): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let currentId = 0;
+  let currentEvent = "";
+  let currentData = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      // Keep the last (potentially incomplete) line in the buffer
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        if (line === "") {
+          // Empty line = event dispatch
+          if (currentEvent && currentData) {
+            if (currentEvent === "done") {
+              try {
+                const d = JSON.parse(currentData);
+                onDone(String(d.status || "completed"));
+              } catch {
+                onDone("completed");
+              }
+            } else {
+              try {
+                const data = JSON.parse(currentData);
+                onEvent({
+                  seq: currentId,
+                  type: currentEvent as EventType,
+                  data,
+                });
+              } catch {
+                // skip malformed data
+              }
+            }
+          }
+          currentId = 0;
+          currentEvent = "";
+          currentData = "";
+        } else if (line.startsWith("id: ")) {
+          currentId = parseInt(line.slice(4), 10) || 0;
+        } else if (line.startsWith("event: ")) {
+          currentEvent = line.slice(7);
+        } else if (line.startsWith("data: ")) {
+          currentData = line.slice(6);
+        } else if (line.startsWith(":")) {
+          // comment (keepalive), ignore
+        }
+      }
+    }
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      return;
+    }
+    onError(err instanceof Error ? err.message : String(err));
+  } finally {
+    reader.releaseLock();
+  }
 }

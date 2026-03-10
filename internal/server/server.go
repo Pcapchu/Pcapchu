@@ -11,21 +11,19 @@ import (
 
 // Server is the HTTP server that exposes the SSE API for Pcapchu.
 type Server struct {
-	store  *storage.Store
-	runner *Runner
-	log    logger.Log
-	mux    *http.ServeMux
-	addr   string
+	store *storage.Store
+	log   *logger.Logger
+	mux   *http.ServeMux
+	addr  string
 }
 
 // New creates a new Server.
-func New(store *storage.Store, log logger.Log, addr string) *Server {
+func New(store *storage.Store, log *logger.Logger, addr string) *Server {
 	s := &Server{
-		store:  store,
-		runner: NewRunner(store, log),
-		log:    log,
-		mux:    http.NewServeMux(),
-		addr:   addr,
+		store: store,
+		log:   log,
+		mux:   http.NewServeMux(),
+		addr:  addr,
 	}
 	s.routes()
 	return s
@@ -51,13 +49,10 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 }
 
 func (s *Server) routes() {
-	// Analysis
-	s.mux.HandleFunc("POST /api/analyze", s.handleAnalyze)
-	s.mux.HandleFunc("POST /api/sessions/{id}/continue", s.handleContinue)
-	s.mux.HandleFunc("POST /api/sessions/{id}/cancel", s.handleCancel)
+	// Analysis (SSE — response is text/event-stream)
+	s.mux.HandleFunc("POST /api/sessions/{id}/analyze", s.handleAnalyze)
 
-	// SSE + event replay
-	s.mux.HandleFunc("GET /api/sessions/{id}/stream", s.handleStream)
+	// Event history (JSON)
 	s.mux.HandleFunc("GET /api/sessions/{id}/events", s.handleEvents)
 
 	// Session CRUD

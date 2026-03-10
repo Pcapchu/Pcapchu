@@ -1,5 +1,4 @@
 import { RotateCcw, CheckCircle2 } from "lucide-react";
-import { Markdown } from "@/components/Markdown";
 
 interface RoundMessageProps {
   type: "start" | "end";
@@ -24,33 +23,12 @@ export function RoundMessage({ type, data }: RoundMessageProps) {
     );
   }
 
-  // round.completed
-  const summary = String(data.summary || "");
-  const keyFindings = String(data.key_findings || "");
-  const markdownReport = String(data.markdown_report || "");
-
+  // round.completed — just a minimal divider, report is shown via report.generated
   return (
-    <div className="flex gap-3 px-4 py-3">
-      <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-green-100 text-green-700 dark:bg-green-950 dark:text-green-400">
-        <CheckCircle2 className="h-3.5 w-3.5" />
-      </div>
-      <div className="flex-1 min-w-0 space-y-1">
-        <p className="text-xs font-medium text-green-700 dark:text-green-400">
-          Round {round} Completed
-        </p>
-        {summary && !markdownReport && (
-          <p className="text-xs text-muted-foreground">{summary}</p>
-        )}
-        {markdownReport && (
-          <div className="mt-2 rounded-lg border bg-card p-4">
-            <Markdown content={markdownReport} />
-          </div>
-        )}
-        {keyFindings && !markdownReport && (
-          <div className="mt-1 rounded-md bg-muted/50 p-2">
-            <Markdown content={keyFindings} />
-          </div>
-        )}
+    <div className="flex justify-center px-4 py-1">
+      <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+        <CheckCircle2 className="h-3 w-3 text-green-600" />
+        Round {round} completed
       </div>
     </div>
   );

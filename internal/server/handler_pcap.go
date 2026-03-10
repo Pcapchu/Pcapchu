@@ -6,11 +6,18 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/Pcapchu/Pcapchu/internal/storage"
+
+	"github.com/google/uuid"
 )
 
-// handlePcapUpload stores a pcap file in the database.
+// handlePcapUpload stores a pcap file and creates a new session bound to it.
 // Accepts multipart/form-data with a "file" field.
+// Returns {session_id, pcap_id, filename, size}.
 func (s *Server) handlePcapUpload(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
 	// Limit upload to 500 MB.
 	if err := r.ParseMultipartForm(500 << 20); err != nil {
 		http.Error(w, "parse form: "+err.Error(), http.StatusBadRequest)
@@ -30,16 +37,28 @@ func (s *Server) handlePcapUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id, err := s.store.InsertPcapFile(r.Context(), header.Filename, data)
+	pcapID, err := s.store.InsertPcapFile(ctx, header.Filename, data)
 	if err != nil {
 		http.Error(w, "store pcap: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	// Create a session bound to this pcap.
+	sessionID := uuid.New().String()
+	sess := storage.Session{
+		ID:         sessionID,
+		PcapFileID: storage.NullInt64(pcapID),
+	}
+	if err := s.store.CreateSession(ctx, sess); err != nil {
+		http.Error(w, "create session: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"id":       id,
-		"filename": header.Filename,
-		"size":     len(data),
+		"session_id": sessionID,
+		"pcap_id":    pcapID,
+		"filename":   header.Filename,
+		"size":       len(data),
 	})
 }
 
@@ -109,13 +128,9 @@ func (s *Server) handleReattachPcap(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	sessionID := r.PathValue("id")
 
-	// Verify session exists and is not running.
+	// Verify session exists.
 	if _, err := s.store.GetSession(ctx, sessionID); err != nil {
 		http.Error(w, "session not found", http.StatusNotFound)
-		return
-	}
-	if s.runner.IsRunning(sessionID) {
-		http.Error(w, "cannot change pcap while session is running", http.StatusConflict)
 		return
 	}
 

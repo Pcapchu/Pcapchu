@@ -11,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import { listSessions, deleteSession } from "@/lib/api";
+import { useStore } from "@/lib/store";
 import type { Session, SessionStatus } from "@/lib/types";
 
 const statusDot: Record<SessionStatus, string> = {
@@ -22,23 +23,13 @@ const statusDot: Record<SessionStatus, string> = {
   interrupted: "bg-orange-500",
 };
 
-interface SidebarProps {
-  currentSessionId: string | null;
-  onSelectSession: (id: string) => void;
-  onNewSession: () => void;
-  collapsed: boolean;
-  onToggle: () => void;
-  refreshKey: number;
-}
-
-export function Sidebar({
-  currentSessionId,
-  onSelectSession,
-  onNewSession,
-  collapsed,
-  onToggle,
-  refreshKey,
-}: SidebarProps) {
+export function Sidebar() {
+  const currentSessionId = useStore((s) => s.currentSessionId);
+  const onSelectSession = useStore((s) => s.handleSelectSession);
+  const onNewSession = useStore((s) => s.handleNewSession);
+  const collapsed = useStore((s) => s.sidebarCollapsed);
+  const onToggle = useStore((s) => s.toggleSidebar);
+  const refreshKey = useStore((s) => s.sidebarRefreshKey);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
 

@@ -2,22 +2,17 @@ import { useState, useRef } from "react";
 import { Send, Paperclip, X, Loader2, Settings } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useStore } from "@/lib/store";
 
-interface ChatInputProps {
-  onSend: (query: string, file: File | null, rounds: number) => void;
-  onOpenSettings: () => void;
-  disabled?: boolean;
-  placeholder?: string;
-  loading?: boolean;
-}
-
-export function ChatInput({
-  onSend,
-  onOpenSettings,
-  disabled,
-  placeholder = "Describe your investigation...",
-  loading,
-}: ChatInputProps) {
+export function ChatInput() {
+  const onSend = useStore((s) => s.handleSend);
+  const onOpenSettings = () => useStore.getState().setPcapManagerOpen(true);
+  const loading = useStore((s) => s.loading);
+  const currentSessionId = useStore((s) => s.currentSessionId);
+  const disabled = loading;
+  const placeholder = currentSessionId
+    ? "Ask a follow-up question..."
+    : "Describe your investigation...";
   const [text, setText] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -25,7 +20,7 @@ export function ChatInput({
   const handleSubmit = () => {
     const query = text.trim();
     if (!query && !file) return;
-    onSend(query, file, 1);
+    onSend(query, file);
     setText("");
     setFile(null);
   };

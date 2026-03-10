@@ -2,7 +2,8 @@
 
 Base URL: `http://localhost:8080` (configurable with `--addr`)
 
-All responses use `Content-Type: application/json` unless noted otherwise.
+Responses use `Content-Type: application/json` for CRUD endpoints and
+`Content-Type: text/event-stream` for analysis endpoints.
 CORS is enabled for all origins (`*`).
 
 ---
@@ -11,12 +12,9 @@ CORS is enabled for all origins (`*`).
 
 - [Quick Start](#quick-start)
 - [Lifecycle](#lifecycle)
-- [Analysis](#analysis)
-  - [POST /api/analyze](#post-apianalyze)
-  - [POST /api/sessions/{id}/continue](#post-apisessionsidcontinue)
-  - [POST /api/sessions/{id}/cancel](#post-apisessionsidcancel)
-- [Event Streaming](#event-streaming)
-  - [GET /api/sessions/{id}/stream](#get-apisessionsidstream)
+- [Analysis (SSE)](#analysis-sse)
+  - [POST /api/sessions/{id}/analyze](#post-apisessionsidanalyze)
+- [Event History (JSON)](#event-history-json)
   - [GET /api/sessions/{id}/events](#get-apisessionsidevents)
 - [Session Management](#session-management)
   - [GET /api/sessions](#get-apisessions)
@@ -38,234 +36,155 @@ CORS is enabled for all origins (`*`).
 # 1. Start the server
 ./pcapchu serve --addr :8080
 
-# 2. Start analysis (upload pcap + query)
-curl -X POST http://localhost:8080/api/analyze \
-  -F "pcap=@capture.pcap" \
-  -F "query=Find security threats" \
-  -F "rounds=2"
-# → {"session_id":"abc-123","status":"running"}
+# 2. Upload pcap — creates a session automatically
+curl -X POST http://localhost:8080/api/pcap/upload \
+  -F "file=@capture.pcap"
+# → {"session_id":"abc-123","pcap_id":1,"filename":"capture.pcap","size":1048576}
 
-# 3. Connect to SSE stream
-curl -N http://localhost:8080/api/sessions/abc-123/stream
+# 3. Start analysis — response is an SSE stream
+curl -N -X POST http://localhost:8080/api/sessions/abc-123/analyze \
+  -H "Content-Type: application/json" \
+  -d '{"query":"Find security threats"}'
 # → event: analysis.started
-# → data: {"session_id":"abc-123","total_rounds":2}
+# → data: {"session_id":"abc-123","total_rounds":1}
 # → ...
 # → event: done
-# → data: {}
+# → data: {"session_id":"abc-123","status":"completed"}
+
+# 4. Run another round (same endpoint, auto-detects continuation)
+curl -N -X POST http://localhost:8080/api/sessions/abc-123/analyze \
+  -H "Content-Type: application/json" \
+  -d '{"query":"Focus on DNS tunneling"}'
+
+# 5. Retrieve history for a past session
+curl http://localhost:8080/api/sessions/abc-123/events
 ```
 
 ---
 
 ## Lifecycle
 
-Investigation lifecycle per request:
+The frontend workflow is:
+
+1. **Upload pcap** → `POST /api/pcap/upload` → returns `session_id`
+2. **Start analysis** → `POST /api/sessions/{id}/analyze` → SSE stream
+3. **Continue (more rounds)** → same endpoint → SSE stream
+
+Each analysis request is **self-contained** — the POST response is an SSE
+stream that stays open until the investigation completes (or the client
+disconnects). There is no global server state tracking running investigations.
 
 ```
-POST /api/analyze
+POST /api/pcap/upload
        │
-       ├─► 201 {"session_id","status":"running"}
+       ├── Store pcap in DB (SHA-256 dedup)
+       ├── Create session with pcap_file_id
+       └── Return {session_id, pcap_id, filename, size}
+
+POST /api/sessions/{id}/analyze  (SSE response)
        │
-       ▼
-   Runner goroutine starts
-       │
-       ├── Create Docker sandbox
-       ├── Copy pcap to container
+       ├── Load session, verify pcap_file_id exists
+       ├── Auto-detect first-run vs continuation (by round count)
+       ├── Create Runtime (Docker sandbox, LLM, agents)
+       ├── Copy pcap from DB to container
        ├── Planner → Executor loop (per round)
-       │      ├── Events broadcast to SSE clients
+       │      ├── Events streamed to SSE client
        │      └── Events persisted to DB (session_events)
        ├── analysis.completed / error
-       └── Docker sandbox cleaned up
-              │
-              ▼
-         SSE stream sends "done" event
-         Runner goroutine exits
+       ├── Docker sandbox cleaned up
+       └── SSE sends "done" event → connection closes
 ```
 
-Key design points:
+Key design:
 
-- **Investigation goroutine uses `context.Background()`** — it outlives the
-  HTTP request that started it. The POST response returns immediately.
-- **SSE stream = observation window** — connecting to `/stream` does not
-  control the investigation lifecycle. You can connect/disconnect freely.
-- **Cancel = explicit** — use `POST /sessions/{id}/cancel` to abort.
-  This cancels the investigation context, triggers Docker cleanup.
-- **Cleanup on goroutine exit** — `env.Cleanup()` always runs via `defer`
-  when the investigation goroutine exits (success, error, or cancel).
-- **Event replay** — all events are persisted to `session_events` with
-  monotonic sequence numbers. Reconnecting to `/stream` or calling
-  `/events` replays stored events from DB.
+- **One Runtime per request** — each analysis request creates its own
+  `investigation.Runtime` (same as CLI), runs the investigation
+  synchronously within the SSE response, then tears down.
+- **Client disconnect = cancel** — when the client closes the connection,
+  `r.Context()` is cancelled, which propagates to the runtime and triggers
+  Docker cleanup.
+- **No global state** — there is no runner, no active session map, no
+  goroutine pool. Each request is fully independent.
+- **Unified endpoint** — `POST /api/sessions/{id}/analyze` handles both
+  first analysis and continuation. It auto-detects by counting existing
+  rounds in the DB.
+- **History via JSON** — `GET /sessions/{id}/events` returns all persisted
+  events. SSE is for live streaming only.
 
 ---
 
-## Analysis
+## Analysis (SSE)
 
-### POST /api/analyze
+### POST /api/sessions/{id}/analyze
 
-Start a new analysis session.
+Start or continue an investigation on an existing session and stream events
+via SSE. Each call runs exactly **one round**. The session must already have
+a pcap attached (created via `POST /api/pcap/upload` or re-attached via
+`PATCH /api/sessions/{id}/pcap`).
 
-**Content-Type:** `multipart/form-data` or `application/json`
+The start round is auto-detected by counting existing rounds in the database.
+Call this endpoint repeatedly to run additional rounds.
 
-#### Multipart form fields
+**Content-Type (request):** `application/json`
+**Content-Type (response):** `text/event-stream`
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `pcap` | file | Yes* | Pcap file upload |
-| `pcap_id` | string | Yes* | OR reference an already-stored pcap by ID |
-| `query` | string | No | Analysis query (default: generic security analysis) |
-| `rounds` | string | No | Number of investigation rounds (default: `"1"`) |
-| `store_pcap` | string | No | `"true"` to persist pcap blob in SQLite |
-
-\*One of `pcap` (file) or `pcap_id` is required.
-
-#### JSON body (alternative)
+#### JSON body
 
 ```json
 {
-  "pcap_id": 1,
-  "query": "Find security threats",
-  "rounds": 2,
-  "store_pcap": true
-}
-```
-
-#### Response — 201 Created
-
-```json
-{
-  "session_id": "550e8400-e29b-41d4-a716-446655440000",
-  "status": "running"
-}
-```
-
-#### Behavior
-
-1. If a pcap file is uploaded, it is always stored in SQLite (SHA-256 deduped).
-2. A temp file is written for copying to the Docker container; cleaned up after
-   the investigation finishes.
-3. The investigation starts in a background goroutine.
-4. An initial `session.created` event (seq=0) is saved to DB immediately.
-
-#### Errors
-
-| Status | Reason |
-|---|---|
-| 400 | No pcap provided (neither file nor pcap_id) |
-| 409 | Session already running (shouldn't happen for new sessions) |
-| 500 | pcap storage / temp file failure |
-
----
-
-### POST /api/sessions/{id}/continue
-
-Add more investigation rounds to an existing session.
-
-**Content-Type:** `application/json`
-
-```json
-{
-  "query": "Focus on DNS tunneling",
-  "rounds": 1
+  "query": "Find security threats"
 }
 ```
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `query` | string | No | Override the original query for new rounds |
-| `rounds` | int | No | Number of additional rounds (default: 1) |
+| `query` | string | No | Analysis query (overrides session's original query) |
 
-#### Response — 200 OK
-
-```json
-{
-  "session_id": "abc-123",
-  "status": "running",
-  "start_round": 3,
-  "end_round": 3
-}
-```
-
-#### Errors
-
-| Status | Reason |
-|---|---|
-| 404 | Session not found |
-| 409 | Session is already running |
-
----
-
-### POST /api/sessions/{id}/cancel
-
-Cancel an active investigation. Triggers context cancellation → Docker cleanup.
-
-#### Response — 200 OK
-
-```json
-{
-  "session_id": "abc-123",
-  "status": "cancelled"
-}
-```
-
-#### Errors
-
-| Status | Reason |
-|---|---|
-| 404 | Session is not running |
-
----
-
-## Event Streaming
-
-### GET /api/sessions/{id}/stream
-
-Server-Sent Events (SSE) endpoint.
-
-**Content-Type:** `text/event-stream`
-
-#### Reconnection
-
-Supports `Last-Event-ID` header. On reconnect, only events with seq > last
-received ID are sent.
-
-#### Behavior
-
-1. **Subscribe** to live event channel (if investigation is active).
-2. **Replay** stored events from DB (skipping any ≤ `Last-Event-ID`).
-3. **Stream** live events (deduped against already-sent seqs).
-4. When investigation finishes, sends `event: done` and closes.
-5. For already-finished sessions, replays all stored events then sends
-   `event: done` immediately.
-6. Keep-alive comments (`: keepalive`) sent every 15 seconds.
-
-#### SSE Wire Format
+#### Response — SSE stream
 
 ```
 id: 1
-event: round.started
-data: {"round":1,"total_rounds":2}
+event: analysis.started
+data: {"session_id":"abc-123","total_rounds":1}
 
 id: 2
-event: step.started
-data: {"step_id":1,"intent":"Analyze DNS traffic","total_steps":3}
+event: round.started
+data: {"round":1,"total_rounds":2}
 
 ...
 
 event: done
-data: {}
+data: {"session_id":"abc-123","status":"completed"}
 ```
 
-Each event has:
-- `id:` — monotonic sequence number (for `Last-Event-ID` reconnect)
-- `event:` — event type string
-- `data:` — JSON payload
+The stream closes after the `done` event. If an error occurs, an `error`
+event is sent before `done`.
 
-The terminal `done` event has no `id:` (seq=0).
+#### Cancellation
+
+Close the HTTP connection to cancel the investigation. The server will:
+1. Cancel the runtime context
+2. Clean up the Docker sandbox
+3. Set session status to `"cancelled"`
+
+#### Errors
+
+| Status | Reason |
+|---|---|
+| 400 | Invalid JSON / session has no pcap attached |
+| 404 | Session not found |
+| 500 | Streaming not supported |
+
+Errors after SSE has started are delivered as `error` events in the stream.
 
 ---
 
+## Event History (JSON)
+
 ### GET /api/sessions/{id}/events
 
-Non-streaming JSON alternative. Returns all stored events for a session.
+Returns all stored events for a session as a JSON array.
+Use this to load history when entering a session view.
 
 #### Response — 200 OK
 
@@ -273,12 +192,6 @@ Non-streaming JSON alternative. Returns all stored events for a session.
 {
   "session_id": "abc-123",
   "events": [
-    {
-      "seq": 0,
-      "type": "session.created",
-      "data": {"session_id":"abc-123","user_query":"...","pcap_source":"db"},
-      "timestamp": "2026-03-09T10:00:00Z"
-    },
     {
       "seq": 1,
       "type": "analysis.started",
@@ -315,8 +228,7 @@ List all sessions.
 }
 ```
 
-`status` reflects the runner's in-memory state — if the runner considers the
-session active, status is overridden to `"running"` regardless of DB value.
+`status` is read directly from the database.
 
 ---
 
@@ -358,7 +270,6 @@ Get a single session with its investigation rounds.
 ### DELETE /api/sessions/{id}
 
 Delete a session and all associated data (rounds, events, snapshots).
-If the session is currently running, it is cancelled first.
 
 #### Response — 204 No Content
 
@@ -378,7 +289,7 @@ is returned (no duplicate storage).
 
 ### POST /api/pcap/upload
 
-Upload and store a pcap file.
+Upload a pcap file and create a new session bound to it.
 
 **Content-Type:** `multipart/form-data`
 
@@ -390,14 +301,15 @@ Upload and store a pcap file.
 
 ```json
 {
-  "id": 1,
+  "session_id": "abc-123",
+  "pcap_id": 1,
   "filename": "capture.pcap",
   "size": 1048576
 }
 ```
 
-If an identical file (same SHA-256) is already stored, the existing ID is
-returned.
+If an identical file (same SHA-256) is already stored, the existing pcap ID
+is reused (no duplicate storage). A new session is always created.
 
 ---
 
@@ -444,8 +356,6 @@ later have a new pcap re-attached via `PATCH /api/sessions/{id}/pcap`.
 Re-attach a pcap file to an existing session. Useful after deleting a pcap
 and re-uploading a replacement, or pointing a session at a different pcap.
 
-Cannot be called while the session is running.
-
 **Content-Type:** `multipart/form-data` or `application/json`
 
 #### Option A: Upload new file
@@ -481,7 +391,6 @@ The file is stored in SQLite (SHA-256 deduped) and bound to the session.
 |---|---|
 | 400 | Missing pcap_id / invalid JSON |
 | 404 | Session or pcap not found |
-| 409 | Session is currently running |
 
 ---
 

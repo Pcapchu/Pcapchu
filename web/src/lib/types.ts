@@ -35,17 +35,17 @@ export interface PcapFile {
   created_at: string;
 }
 
-// --- Analysis ---
-export interface AnalyzeResponse {
+// --- Upload / Reattach ---
+export interface UploadResponse {
   session_id: string;
-  status: string;
+  pcap_id: number;
+  filename: string;
+  size: number;
 }
 
-export interface ContinueResponse {
+export interface ReattachResponse {
   session_id: string;
-  status: string;
-  start_round: number;
-  end_round: number;
+  pcap_id: number;
 }
 
 // --- SSE Events ---
@@ -102,7 +102,7 @@ export interface RoundCompletedData {
 export interface PlanCreatedData {
   thought: string;
   total_steps: number;
-  steps: Array<{ id: number; intent: string }>;
+  steps: Array<{ step_id: number; intent: string }>;
 }
 
 export interface StepStartedData {

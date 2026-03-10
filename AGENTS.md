@@ -243,43 +243,50 @@ Full API documentation: [`internal/server/API.md`](./internal/server/API.md).
 ```
    Frontend (browser)
        │
-       ├── POST /api/analyze       → Start new investigation
-       ├── GET  /api/sessions/{id}/stream  → SSE event stream
-       ├── POST /api/sessions/{id}/cancel  → Cancel active investigation
-       ├── GET  /api/sessions      → List sessions
-       └── POST /api/pcap/upload   → Upload pcap files
+       ├── POST /api/pcap/upload              → JSON: upload pcap + create session
+       ├── POST /api/sessions/{id}/analyze    → SSE: start/continue investigation
+       ├── GET  /api/sessions/{id}/events     → JSON: stored event history
+       ├── GET  /api/sessions                 → JSON: list sessions
+       └── PATCH /api/sessions/{id}/pcap      → JSON: re-attach pcap to session
               │
               ▼
    ┌──────────────────────────────────────────┐
    │  Server (internal/server/)               │
    │                                          │
    │  ┌─────────┐    ┌────────────────────┐   │
-   │  │ Router  │───>│ Runner             │   │
-   │  │ (mux)   │    │ - per-session ctx  │   │
-   │  └─────────┘    │ - Docker sandbox   │   │
-   │                 │ - event broadcast  │   │
-   │                 │ - DB persistence   │   │
+   │  │ Router  │───>│ Per-request Runtime │   │
+   │  │ (mux)   │    │ (investigation.     │   │
+   │  └─────────┘    │  NewRuntime)        │   │
+   │                 │ - Docker sandbox    │   │
+   │                 │ - LLM + agents     │   │
+   │                 │ - Event emitter    │   │
    │                 └────────┬───────────┘   │
    │                          │               │
    │                          ▼               │
    │            investigation.RunInvestigation│
    │                          │               │
    │                          ▼               │
-   │              SSE clients ← broadcast     │
+   │              SSE client ← event stream   │
    │              session_events ← persist    │
    └──────────────────────────────────────────┘
 ```
 
 Key design:
-- **Investigation outlives HTTP request** — `runner.Start()` uses
-  `context.Background()`. The POST returns immediately with session ID.
-- **SSE = observation window** — `/stream` does not control the investigation
-  lifecycle. Multiple clients can connect. Reconnect with `Last-Event-ID`.
-- **Cancel = explicit** — `POST /sessions/{id}/cancel` cancels the context.
-- **Cleanup guaranteed** — Docker sandbox `env.Cleanup()` runs via `defer`
-  in the investigation goroutine (success, error, or cancel).
-- **Event replay** — all events persisted to `session_events` with monotonic
-  seq. Reconnecting replays from DB, then continues live.
+- **Upload creates session** — `POST /api/pcap/upload` stores the pcap and
+  creates a session bound to it, returning the `session_id`.
+- **One Runtime per request** — `POST /api/sessions/{id}/analyze` creates
+  an `investigation.Runtime` (same as CLI), runs the investigation
+  synchronously within the SSE response, then tears down. No global state.
+- **Unified endpoint** — the analyze endpoint handles both first analysis
+  and continuation by auto-detecting via round count in the DB.
+- **SSE = inline with analysis** — the analysis endpoint IS the SSE stream.
+  Events are streamed live as the investigation runs.
+- **Client disconnect = cancel** — closing the HTTP connection cancels
+  `r.Context()`, which propagates to the runtime and triggers cleanup.
+- **Cleanup guaranteed** — `rt.Close()` runs via `defer` (Docker sandbox
+  cleanup + emitter close).
+- **History via JSON** — `GET /sessions/{id}/events` returns all persisted
+  events for past sessions. SSE is for live streaming only.
 
 ---
 
@@ -292,7 +299,7 @@ Pcapchu/
 |-- internal/
 |   |-- cli/                       # CLI layer (cobra commands + runtime)
 |   |   |-- root.go                #   Root command, Execute(), --db flag
-|   |   |-- runtime.go             #   Runtime bootstrap (newRuntime, Close)
+|   |   |-- runtime.go             #   CLI runtime wrapper (signal handling, OTel, event printer)
 |   |   |-- analyze.go             #   "analyze" subcommand, resumeSession()
 |   |   |-- serve.go               #   "serve" subcommand (HTTP SSE server)
 |   |   |-- session.go             #   "session list/resume/delete"
@@ -305,7 +312,8 @@ Pcapchu/
 |   |-- executor/
 |   |   `-- executor.go            #   Executor graph (normal + final step pipeline)
 |   |-- investigation/
-|   |   `-- investigation.go       #   RunInvestigation, CopyPcapToContainer, NewReActAgent
+|   |   |-- investigation.go       #   RunInvestigation, CopyPcapToContainer, NewReActAgent
+|   |   `-- runtime.go             #   Runtime: shared init (Docker, LLM, agents)
 |   |-- planner/
 |   |   `-- planner.go             #   Planner graph (prompt + ReAct + JSON parse)
 |   |-- prompts/
@@ -320,17 +328,16 @@ Pcapchu/
 |   |   |-- API.md                 #   Full API documentation
 |   |   |-- server.go              #   Server struct, routes, CORS, ListenAndServe
 |   |   |-- sse.go                 #   SSE writer helper (writeEvent, writeComment)
-|   |   |-- runner.go              #   Runner: per-session investigation goroutines
-|   |   |-- handler_analyze.go     #   POST /api/analyze, continue, cancel
-|   |   |-- handler_stream.go      #   GET /api/sessions/{id}/stream (SSE), events
+|   |   |-- handler_analyze.go     #   POST /api/sessions/{id}/analyze (SSE)
+|   |   |-- handler_stream.go      #   GET /api/sessions/{id}/events (JSON history)
 |   |   |-- handler_session.go     #   GET/DELETE /api/sessions
-|   |   `-- handler_pcap.go        #   POST/GET/DELETE /api/pcap, PATCH pcap reattach
+|   |   `-- handler_pcap.go        #   POST /api/pcap/upload (creates session), GET/DELETE, PATCH reattach
 |   `-- storage/
 |       |-- models.go              #   PcapFile, Session, Round, SessionEvent models
 |       `-- store.go               #   SQLite CRUD (sqlx), schema DDL, migrations
 |-- middlewares/
 |   |-- logger/
-|   |   |-- logger.go              #   Log interface, Logger struct, Emit()
+|   |   |-- logger.go              #   Log interface, Logger struct, Emit(), NewDefaultLogger
 |   |   |-- sink.go                #   Sink interface, NopSink, MultiSink
 |   |   |-- console_sink.go        #   Console sink with content truncation
 |   |   |-- pretty_handler.go      #   Custom slog handler (colored, multi-line)
@@ -390,11 +397,8 @@ go vet ./...
 ### Run
 
 ```bash
-# New analysis (CLI)
+# New analysis (CLI — pcap is always stored in the DB)
 ./pcapchu analyze --pcap capture.pcap --query "Find security threats" --rounds 2
-
-# Store pcap in SQLite
-./pcapchu analyze --pcap capture.pcap --store-pcap
 
 # Resume a session
 ./pcapchu session resume <session-id> --rounds 1

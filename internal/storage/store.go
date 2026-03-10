@@ -488,6 +488,17 @@ func (s *Store) UpdateSessionStatus(ctx context.Context, sessionID, status strin
 	return nil
 }
 
+// UpdateSessionQuery sets the user_query field for a session.
+func (s *Store) UpdateSessionQuery(ctx context.Context, sessionID, query string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE sessions SET user_query = ?, updated_at = ? WHERE id = ?`,
+		query, time.Now().UTC(), sessionID)
+	if err != nil {
+		return fmt.Errorf("update session query: %w", err)
+	}
+	return nil
+}
+
 // LoadRounds returns all rounds for a session, ordered by round number.
 func (s *Store) LoadRounds(ctx context.Context, sessionID string) ([]Round, error) {
 	var rounds []Round
