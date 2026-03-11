@@ -114,6 +114,7 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 		TotalRounds: analyzeRounds,
 	})
 
+	rt.SetUserQuery(analyzeQuery)
 	if err := investigation.RunInvestigation(rt.Ctx(), rt.Log(), rt.Planner(), rt.Exec(), rt.Compressor(), store, sessionID, analyzeQuery, containerPcapPath, 1, analyzeRounds); err != nil {
 		return err
 	}
@@ -168,6 +169,7 @@ func resumeSession(store *storage.Store, sessionID, queryOverride string, rounds
 		TotalRounds: endRound,
 	})
 
+	rt.SetUserQuery(query)
 	if err := investigation.RunInvestigation(rt.Ctx(), rt.Log(), rt.Planner(), rt.Exec(), rt.Compressor(), store, sessionID, query, containerPcapPath, startRound, endRound); err != nil {
 		return err
 	}

@@ -105,7 +105,7 @@ func (e *Executor) Run(ctx context.Context, plan common.Plan, userQuery string, 
 				return nil, err
 			}
 			e.log.Info(ctx, label+" output",
-				logger.A("content", common.TruncateStr(out.Content, 500)))
+				logger.A("content", out.Content))
 			return out, nil
 		})
 	}
@@ -284,7 +284,7 @@ func (e *Executor) Run(ctx context.Context, plan common.Plan, userQuery string, 
 			return nil, err
 		}
 		e.log.Info(ctx, "FinalSummary-ChatModel output",
-			logger.A("content", common.TruncateStr(out.Content, 500)))
+			logger.A("content", out.Content))
 		return out, nil
 	})
 
@@ -292,7 +292,7 @@ func (e *Executor) Run(ctx context.Context, plan common.Plan, userQuery string, 
 	finalParseLambda := compose.InvokableLambda(func(ctx context.Context, in *schema.Message) (string, error) {
 		e.log.Info(ctx, "final executor output",
 			logger.A(logger.AttrContentLength, len(in.Content)),
-			logger.A("content", common.TruncateStr(in.Content, 1000)))
+			logger.A("content", in.Content))
 
 		str, err := common.ExtractJSON(in.Content)
 		if err != nil {

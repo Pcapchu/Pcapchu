@@ -38,14 +38,6 @@ func ExtractJSON(input string) (string, error) {
 	return input[start : end+1], nil
 }
 
-// TruncateStr truncates a string to maxLen characters, appending "..." if truncated.
-func TruncateStr(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
-}
-
 // FormatPlanOverview formats a Plan into a human-readable markdown summary.
 func FormatPlanOverview(p Plan) string {
 	var sb strings.Builder

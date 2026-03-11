@@ -9,6 +9,7 @@ import (
 	"github.com/Pcapchu/Pcapchu/internal/events"
 	"github.com/Pcapchu/Pcapchu/internal/executor"
 	"github.com/Pcapchu/Pcapchu/internal/planner"
+	"github.com/Pcapchu/Pcapchu/middlewares/httpclient"
 	"github.com/Pcapchu/Pcapchu/middlewares/logger"
 	"github.com/Pcapchu/Pcapchu/middlewares/summarizer"
 	"github.com/Pcapchu/Pcapchu/sandbox/environment"
@@ -17,19 +18,21 @@ import (
 	"github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/callbacks"
 	"github.com/cloudwego/eino/components/tool"
+	"github.com/cloudwego/eino/schema"
 )
 
 // Runtime bundles the components needed to run an investigation.
 // Both CLI and server create a Runtime per investigation.
 type Runtime struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	log        logger.Log
-	emitter    *events.ChannelEmitter
-	env        environment.Env
-	planner    *planner.Planner
-	exec       *executor.Executor
-	compressor *summarizer.HistoryCompressor
+	ctx         context.Context
+	cancel      context.CancelFunc
+	log         logger.Log
+	emitter     *events.ChannelEmitter
+	env         environment.Env
+	planner     *planner.Planner
+	exec        *executor.Executor
+	compressor  *summarizer.HistoryCompressor
+	langHint    *LangHintModifier
 	cleanupOnce sync.Once
 }
 
@@ -50,9 +53,10 @@ func NewRuntime(parentCtx context.Context, log logger.Log, emitter *events.Chann
 	}
 
 	chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
-		APIKey:  apiKey,
-		Model:   modelName,
-		BaseURL: baseURL,
+		APIKey:     apiKey,
+		Model:      modelName,
+		BaseURL:    baseURL,
+		HTTPClient: httpclient.NewResilientClient(),
 	})
 	if err != nil {
 		cancel()
@@ -85,10 +89,20 @@ func NewRuntime(parentCtx context.Context, log logger.Log, emitter *events.Chann
 
 	// --- Logger callback ---
 	loggerCB := logger.NewLoggerCallback(log)
-	callbacks.AppendGlobalHandlers(loggerCB)
+	callbacks.InitCallbackHandlers([]callbacks.Handler{loggerCB})
+	// callbacks.AppendGlobalHandlers(loggerCB)
+
+	// --- Language hint modifier ---
+	langHint := &LangHintModifier{}
+
+	// Compose rewriters: language hint first, then conversation summariser.
+	execRewriter := func(ctx context.Context, msgs []*schema.Message) []*schema.Message {
+		msgs = langHint.Rewrite(ctx, msgs)
+		return convSummarizer.SummarizeContext(ctx, msgs)
+	}
 
 	// --- ReAct agents ---
-	execAgent, err := NewReActAgent(ctx, chatModel, allTools, 200, convSummarizer.SummarizeContext)
+	execAgent, err := NewReActAgent(ctx, chatModel, allTools, 200, execRewriter)
 	if err != nil {
 		env.Cleanup(ctx)
 		cancel()
@@ -96,7 +110,7 @@ func NewRuntime(parentCtx context.Context, log logger.Log, emitter *events.Chann
 		return nil, fmt.Errorf("create executor agent: %w", err)
 	}
 
-	plannerAgent, err := NewReActAgent(ctx, chatModel, allTools, 200, nil)
+	plannerAgent, err := NewReActAgent(ctx, chatModel, allTools, 200, langHint.Rewrite)
 	if err != nil {
 		env.Cleanup(ctx)
 		cancel()
@@ -124,6 +138,7 @@ func NewRuntime(parentCtx context.Context, log logger.Log, emitter *events.Chann
 		planner:    p,
 		exec:       exec,
 		compressor: compressor,
+		langHint:   langHint,
 	}, nil
 }
 
@@ -136,6 +151,9 @@ func (r *Runtime) Env() environment.Env                      { return r.env }
 func (r *Runtime) Planner() *planner.Planner                 { return r.planner }
 func (r *Runtime) Exec() *executor.Executor                  { return r.exec }
 func (r *Runtime) Compressor() *summarizer.HistoryCompressor { return r.compressor }
+
+// SetUserQuery updates the language hint based on the user's query language.
+func (r *Runtime) SetUserQuery(query string) { r.langHint.SetQuery(query) }
 
 // Close tears down the runtime. Safe to call multiple times.
 func (r *Runtime) Close() {

@@ -16,16 +16,33 @@ type ConsoleSink struct {
 
 const defaultMaxContentLen = 2000
 
+// ConsoleOption configures a ConsoleSink.
+type ConsoleOption func(*ConsoleSink)
+
+// WithTruncate sets the maximum length for string attributes.
+// 0 disables truncation. Default is 2000.
+func WithTruncate(maxLen int) ConsoleOption {
+	return func(c *ConsoleSink) { c.maxContentLen = maxLen }
+}
+
 // NewConsoleSink creates a compact single-line console sink.
-func NewConsoleSink() Sink {
+func NewConsoleSink(opts ...ConsoleOption) Sink {
 	h := newPrettyHandler(os.Stdout, slog.LevelDebug, true, false)
-	return &ConsoleSink{logger: slog.New(h), maxContentLen: defaultMaxContentLen}
+	c := &ConsoleSink{logger: slog.New(h), maxContentLen: defaultMaxContentLen}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
 }
 
 // NewPrettyConsoleSink creates a multi-line aligned console sink.
-func NewPrettyConsoleSink() Sink {
+func NewPrettyConsoleSink(opts ...ConsoleOption) Sink {
 	h := newPrettyHandler(os.Stdout, slog.LevelDebug, true, true)
-	return &ConsoleSink{logger: slog.New(h), maxContentLen: defaultMaxContentLen}
+	c := &ConsoleSink{logger: slog.New(h), maxContentLen: defaultMaxContentLen}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
 }
 
 func (c *ConsoleSink) Log(ctx context.Context, level Level, msg string, attrs ...Attr) {

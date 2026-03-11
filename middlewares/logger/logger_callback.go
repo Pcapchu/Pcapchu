@@ -45,7 +45,7 @@ func (cb *LoggerCallback) OnStart(ctx context.Context, info *callbacks.RunInfo, 
 			last := mi.Messages[len(mi.Messages)-1]
 			attrs = append(attrs, A("last_role", last.Role))
 			attrs = append(attrs, A("last_content_length", len(last.Content)))
-			attrs = append(attrs, A("last_content", truncate(last.Content, 500)))
+			attrs = append(attrs, A("last_content", last.Content))
 		}
 		if mi.Config != nil && mi.Config.Model != "" {
 			attrs = append(attrs, A(AttrModelName, mi.Config.Model))
@@ -63,7 +63,7 @@ func (cb *LoggerCallback) OnStart(ctx context.Context, info *callbacks.RunInfo, 
 
 	// Try typed tool input.
 	if ti := tool.ConvCallbackInput(input); ti != nil {
-		attrs = append(attrs, A("arguments_json", truncate(ti.ArgumentsInJSON, 500)))
+		attrs = append(attrs, A("arguments_json", ti.ArgumentsInJSON))
 	}
 
 	cb.log.Info(ctx, "callback.start", attrs...)
@@ -85,7 +85,7 @@ func (cb *LoggerCallback) OnEnd(ctx context.Context, info *callbacks.RunInfo, ou
 		if mo.Message != nil {
 			attrs = append(attrs, A("role", mo.Message.Role))
 			attrs = append(attrs, A(AttrContentLength, len(mo.Message.Content)))
-			attrs = append(attrs, A("content", truncate(mo.Message.Content, 500)))
+			attrs = append(attrs, A("content", mo.Message.Content))
 			if len(mo.Message.ToolCalls) > 0 {
 				attrs = append(attrs, A("tool_calls", len(mo.Message.ToolCalls)))
 			}
@@ -99,7 +99,7 @@ func (cb *LoggerCallback) OnEnd(ctx context.Context, info *callbacks.RunInfo, ou
 
 	// Try typed tool output.
 	if to := tool.ConvCallbackOutput(output); to != nil {
-		attrs = append(attrs, A("response", truncate(to.Response, 500)))
+		attrs = append(attrs, A("response", to.Response))
 	}
 
 	cb.log.Info(ctx, "callback.end", attrs...)
@@ -160,14 +160,4 @@ func (cb *LoggerCallback) OnStartWithStreamInput(ctx context.Context, info *call
 	return ctx
 }
 
-// truncate shortens a string to maxLen runes, appending "..." if truncated.
-func truncate(s string, maxLen int) string {
-	if maxLen <= 0 || len(s) <= maxLen {
-		return s
-	}
-	r := []rune(s)
-	if len(r) <= maxLen {
-		return s
-	}
-	return string(r[:maxLen]) + "..."
-}
+

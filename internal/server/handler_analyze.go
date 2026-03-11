@@ -112,6 +112,8 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	rt.SetUserQuery(query)
+
 	// Subscribe to events from the runtime's emitter.
 	ch := rt.Emitter().Subscribe()
 

@@ -47,15 +47,14 @@ type Log interface {
 
 // Logger combines structured logging (via Sink) and domain event emission
 // (via EmitFunc). All output is handled by the Sink chain.
-// Use the chain methods to compose the desired configuration.
+// Truncation is the responsibility of each Sink — Logger passes data through unmodified.
 type Logger struct {
-	sink          Sink
-	emit          EmitFunc
-	maxContentLen int // 0 = no truncation
+	sink Sink
+	emit EmitFunc
 }
 
 // NewLogger creates a bare Logger with no sinks or emitters.
-// Chain WithSink, WithEmit, WithMaxContentLen to configure.
+// Chain WithSink, WithEmit to configure.
 func NewLogger() *Logger {
 	return &Logger{}
 }
@@ -76,13 +75,6 @@ func (l *Logger) WithSink(s Sink) *Logger {
 // WithEmit sets the EmitFunc for domain event broadcasting (e.g. to SSE/streaming).
 func (l *Logger) WithEmit(fn EmitFunc) *Logger {
 	l.emit = fn
-	return l
-}
-
-// WithMaxContentLen sets the truncation length for string Attrs sent to the
-// Sink via Emit(). 0 (default) means no truncation.
-func (l *Logger) WithMaxContentLen(n int) *Logger {
-	l.maxContentLen = n
 	return l
 }
 

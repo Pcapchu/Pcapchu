@@ -53,7 +53,7 @@ func NewPlanner(ctx context.Context, rAgent *react.Agent, log logger.Log) (*Plan
 			return nil, err
 		}
 		log.Info(ctx, "planner react output",
-			logger.A("content", common.TruncateStr(out.Content, 500)))
+			logger.A("content", out.Content))
 		return out, nil
 	})
 
@@ -64,9 +64,9 @@ func NewPlanner(ctx context.Context, rAgent *react.Agent, log logger.Log) (*Plan
 		if err != nil {
 			return common.Plan{}, fmt.Errorf("extract json from planner output: %w", err)
 		}
-		log.Info(ctx, "planner extracted json", logger.A("json", common.TruncateStr(str, 500)))
+		log.Info(ctx, "planner extracted json", logger.A("json", str))
 		if err := json.Unmarshal([]byte(str), &plan); err != nil {
-			return common.Plan{}, fmt.Errorf("unmarshal plan: %w | content: %s", err, common.TruncateStr(input.Content, 1000))
+			return common.Plan{}, fmt.Errorf("unmarshal plan: %w", err)
 		}
 		log.Info(ctx, "planner plan parsed", logger.A("step_count", len(plan.Steps)))
 		return plan, nil
