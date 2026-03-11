@@ -45,7 +45,7 @@ var sessionListCmd = &cobra.Command{
 		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 		fmt.Fprintln(w, "ID\tQUERY\tROUNDS\tPCAP\tCREATED\tUPDATED")
 		for _, s := range items {
-			q := s.UserQuery
+			q := s.SessionTitle
 			if len(q) > 60 {
 				q = q[:57] + "..."
 			}

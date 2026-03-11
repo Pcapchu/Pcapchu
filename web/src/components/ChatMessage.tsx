@@ -12,23 +12,8 @@ export function ChatMessage({ event, completedStepIds }: { event: SSEEvent; comp
   const completed = completedStepIds ?? new Set<number>();
   switch (event.type) {
     case "session.created":
-      return <UserQueryMessage data={event.data} />;
-
     case "session.resumed":
-      return (
-        <SystemMessage
-          icon="play"
-          text={`Session resumed from round ${event.data.from_round}`}
-        />
-      );
-
-    case "analysis.started":
-      return (
-        <SystemMessage
-          icon="activity"
-          text={`Investigation started — ${event.data.total_rounds} round${Number(event.data.total_rounds) !== 1 ? "s" : ""}`}
-        />
-      );
+      return <UserQueryMessage data={event.data} />;
 
     case "analysis.completed":
       return <SystemMessage icon="check" text="Investigation completed" variant="success" />;

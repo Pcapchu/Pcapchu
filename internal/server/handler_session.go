@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http"
 	"time"
 )
@@ -14,13 +15,13 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type sessionJSON struct {
-		ID         string `json:"id"`
-		UserQuery  string `json:"user_query"`
-		RoundCount int    `json:"round_count"`
-		Status     string `json:"status"`
-		PcapSource string `json:"pcap_source"`
-		CreatedAt  string `json:"created_at"`
-		UpdatedAt  string `json:"updated_at"`
+		ID           string `json:"id"`
+		SessionTitle string `json:"session_title"`
+		RoundCount   int    `json:"round_count"`
+		Status       string `json:"status"`
+		PcapSource   string `json:"pcap_source"`
+		CreatedAt    string `json:"created_at"`
+		UpdatedAt    string `json:"updated_at"`
 	}
 
 	result := make([]sessionJSON, 0, len(items))
@@ -30,13 +31,13 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 			status = "idle"
 		}
 		result = append(result, sessionJSON{
-			ID:         item.ID,
-			UserQuery:  item.UserQuery,
-			RoundCount: item.RoundCount,
-			Status:     status,
-			PcapSource: item.PcapSource(),
-			CreatedAt:  item.CreatedAt.Format(time.RFC3339),
-			UpdatedAt:  item.UpdatedAt.Format(time.RFC3339),
+			ID:           item.ID,
+			SessionTitle: item.SessionTitle,
+			RoundCount:   item.RoundCount,
+			Status:       status,
+			PcapSource:   item.PcapSource(),
+			CreatedAt:    item.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:    item.UpdatedAt.Format(time.RFC3339),
 		})
 	}
 
@@ -45,7 +46,9 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleGetSession returns a single session with its rounds.
+// handleGetSession returns a single session with its history organized by round.
+// Each round contains the user query for that round and all events that occurred
+// during that round, assembled from session_events + round_queries tables.
 func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("id")
 
@@ -55,31 +58,61 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rounds, err := s.store.LoadRounds(r.Context(), sessionID)
+	evts, err := s.store.LoadSessionEvents(r.Context(), sessionID)
 	if err != nil {
-		http.Error(w, "load rounds: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "load events: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	type roundJSON struct {
-		Round          int    `json:"round"`
-		Summary        string `json:"summary"`
-		KeyFindings    string `json:"key_findings"`
-		OpenQuestions   string `json:"open_questions"`
-		MarkdownReport string `json:"markdown_report,omitempty"`
-		CreatedAt      string `json:"created_at"`
+	queries, err := s.store.LoadRoundQueries(r.Context(), sessionID)
+	if err != nil {
+		http.Error(w, "load round queries: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
 
-	roundList := make([]roundJSON, 0, len(rounds))
-	for _, rd := range rounds {
-		roundList = append(roundList, roundJSON{
-			Round:          rd.Round,
-			Summary:        rd.Summary,
-			KeyFindings:    rd.KeyFindings,
-			OpenQuestions:   rd.OpenQuestions,
-			MarkdownReport: rd.MarkdownReport,
-			CreatedAt:      rd.CreatedAt.Format(time.RFC3339),
+	// Build query lookup: round → user_query.
+	queryMap := make(map[int]string, len(queries))
+	for _, q := range queries {
+		queryMap[q.Round] = q.UserQuery
+	}
+
+	// Group events by round.
+	type eventJSON struct {
+		Seq       int             `json:"seq"`
+		Type      string          `json:"type"`
+		Data      json.RawMessage `json:"data"`
+		Timestamp string          `json:"timestamp"`
+	}
+	type roundJSON struct {
+		Round     int         `json:"round"`
+		UserQuery string      `json:"user_query"`
+		Events    []eventJSON `json:"events"`
+	}
+
+	roundMap := make(map[int]*roundJSON)
+	var roundOrder []int
+
+	for _, ev := range evts {
+		rj, ok := roundMap[ev.Round]
+		if !ok {
+			rj = &roundJSON{
+				Round:     ev.Round,
+				UserQuery: queryMap[ev.Round],
+			}
+			roundMap[ev.Round] = rj
+			roundOrder = append(roundOrder, ev.Round)
+		}
+		rj.Events = append(rj.Events, eventJSON{
+			Seq:       ev.Seq,
+			Type:      ev.EventType,
+			Data:      json.RawMessage(ev.Data),
+			Timestamp: ev.CreatedAt.Format(time.RFC3339),
 		})
+	}
+
+	rounds := make([]roundJSON, 0, len(roundOrder))
+	for _, rn := range roundOrder {
+		rounds = append(rounds, *roundMap[rn])
 	}
 
 	status := sess.Status
@@ -88,13 +121,13 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":          sess.ID,
-		"user_query":  sess.UserQuery,
-		"status":      status,
-		"rounds":      roundList,
-		"round_count": len(rounds),
-		"created_at":  sess.CreatedAt.Format(time.RFC3339),
-		"updated_at":  sess.UpdatedAt.Format(time.RFC3339),
+		"id":            sess.ID,
+		"session_title": sess.SessionTitle,
+		"status":        status,
+		"rounds":        rounds,
+		"round_count":   len(rounds),
+		"created_at":    sess.CreatedAt.Format(time.RFC3339),
+		"updated_at":    sess.UpdatedAt.Format(time.RFC3339),
 	})
 }
 

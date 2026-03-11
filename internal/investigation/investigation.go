@@ -48,6 +48,10 @@ func CopyPcapToContainer(ctx context.Context, env environment.Env, sess *storage
 	return "", fmt.Errorf("session has no pcap source")
 }
 
+// OnRoundDone is called after each round completes successfully.
+// The caller decides whether to persist the round immediately (CLI) or buffer it (server).
+type OnRoundDone func(ctx context.Context, round storage.Round) error
+
 // RunInvestigation is the shared investigation loop used by both CLI and server.
 func RunInvestigation(
 	ctx context.Context,
@@ -58,6 +62,7 @@ func RunInvestigation(
 	store *storage.Store,
 	sessionID, query, containerPcapPath string,
 	startRound, endRound int,
+	onRoundDone OnRoundDone,
 ) error {
 	const (
 		scopeKeyFindings    = "key_findings"
@@ -149,17 +154,22 @@ func RunInvestigation(
 			break
 		}
 
-		if err := store.SaveRound(ctx, sessionID, storage.Round{
+		roundData := storage.Round{
 			Round:            round,
+			UserQuery:        query,
 			ResearchFindings: result.Findings,
 			OperationLog:     result.OperationLog,
 			Summary:          result.Summary,
 			KeyFindings:      result.KeyFindings,
 			OpenQuestions:     result.OpenQuestions,
 			MarkdownReport:   result.MarkdownReport,
-		}); err != nil {
-			log.Error(ctx, "save round failed", logger.A(logger.AttrError, err.Error()))
-			break
+		}
+
+		if onRoundDone != nil {
+			if err := onRoundDone(ctx, roundData); err != nil {
+				log.Error(ctx, "onRoundDone failed", logger.A(logger.AttrError, err.Error()))
+				break
+			}
 		}
 
 		log.Emit(events.TypeRoundCompleted, events.RoundCompletedData{

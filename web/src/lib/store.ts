@@ -3,7 +3,7 @@ import type { SSEEvent } from "./types";
 import {
   uploadPcap,
   analyzeSession,
-  loadSessionEvents,
+  getSession,
 } from "./api";
 
 // ---------------------------------------------------------------------------
@@ -177,8 +177,33 @@ export const useStore = create<AppState & AppActions>()((set, get) => ({
     });
 
     try {
-      const stored = await loadSessionEvents(id);
-      set({ events: stored });
+      const detail = await getSession(id);
+      // Flatten rounds into a flat SSEEvent[] for the chat view.
+      // For each round, inject a synthetic user-query event, then append
+      // all stored events in sequence order.
+      const flat: SSEEvent[] = [];
+      for (const r of detail.rounds) {
+        if (r.user_query) {
+          // First round → session.created, subsequent → session.resumed
+          const isFirst = r.round === 1;
+          flat.push({
+            seq: 0,
+            type: isFirst ? "session.created" : "session.resumed",
+            data: isFirst
+              ? { session_id: id, user_query: r.user_query, pcap_source: "" }
+              : { session_id: id, user_query: r.user_query, from_round: r.round - 1 },
+          });
+        }
+        for (const ev of r.events) {
+          flat.push({
+            seq: ev.seq,
+            type: ev.type as SSEEvent["type"],
+            data: ev.data,
+            timestamp: ev.timestamp,
+          });
+        }
+      }
+      set({ events: flat });
     } catch {
       // No stored events — empty state is fine
     }

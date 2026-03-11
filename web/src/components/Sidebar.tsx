@@ -101,9 +101,9 @@ export function Sidebar() {
               <MessageSquare className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               <div className="flex-1 min-w-0">
                 <p className="truncate text-xs font-medium leading-snug">
-                  {s.user_query.length > 50
-                    ? s.user_query.slice(0, 50) + "..."
-                    : s.user_query}
+                  {s.session_title.length > 50
+                    ? s.session_title.slice(0, 50) + "..."
+                    : s.session_title}
                 </p>
                 <div className="mt-0.5 flex items-center gap-1.5">
                   <span className={cn("h-1.5 w-1.5 rounded-full", statusDot[s.status])} />

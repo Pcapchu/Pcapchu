@@ -19,9 +19,11 @@ type analyzeRequest struct {
 
 // handleAnalyze runs one investigation round on an existing session and streams
 // events via SSE. The session must already have a pcap attached (via
-// POST /api/pcap/upload or PATCH /api/sessions/{id}/pcap).
-// Call this endpoint repeatedly to run additional rounds — the start round is
-// auto-detected from the database.
+// POST /api/pcap/upload).
+//
+// No data is persisted until the investigation completes successfully.
+// A roundCollector buffers round results in memory; on success it flushes
+// everything to the database atomically.
 //
 // Request: POST /api/sessions/{id}/analyze  {"query":"..."}
 // Response: text/event-stream
@@ -35,24 +37,22 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Load session, verify it exists and has a pcap.
 	sess, err := s.store.GetSession(ctx, sessionID)
 	if err != nil {
 		http.Error(w, "session not found", http.StatusNotFound)
 		return
 	}
-
 	if !sess.PcapFileID.Valid {
 		http.Error(w, "session has no pcap file attached", http.StatusBadRequest)
 		return
 	}
 
-	query := sess.UserQuery
-	if req.Query != "" {
-		query = req.Query
+	query := req.Query
+	if query == "" {
+		http.Error(w, "query is required", http.StatusBadRequest)
+		return
 	}
 
-	// Determine start/end rounds (auto-detect first-run vs continuation).
 	prevRounds, err := s.store.RoundCount(ctx, sessionID)
 	if err != nil {
 		http.Error(w, "count rounds: "+err.Error(), http.StatusInternalServerError)
@@ -68,7 +68,7 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create per-request emitter + logger with emitFunc wired.
+	// Per-request emitter + logger.
 	emitter := events.NewChannelEmitter(1024)
 	log := logger.NewLogger().
 		WithSink(s.log.Sink()).
@@ -82,13 +82,6 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rt.Close()
-
-	_ = s.store.UpdateSessionStatus(ctx, sessionID, "running")
-
-	// Save the user query on first analysis so it appears in session listings.
-	if prevRounds == 0 && query != "" {
-		_ = s.store.UpdateSessionQuery(ctx, sessionID, query)
-	}
 
 	// Emit session lifecycle event.
 	if prevRounds == 0 {
@@ -104,31 +97,32 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Copy pcap into container from DB.
+	// Copy pcap into container.
 	containerPcapPath, err := investigation.CopyPcapToContainer(rt.Ctx(), rt.Env(), sess, s.store, "")
 	if err != nil {
 		sseError(sse, "init", fmt.Sprintf("copy pcap: %v", err))
-		_ = s.store.UpdateSessionStatus(ctx, sessionID, "error")
 		return
 	}
 
 	rt.SetUserQuery(query)
 
-	// Subscribe to events from the runtime's emitter.
+	// Collector buffers events + round data in memory — no DB writes during SSE.
+	collector := newTxCollector(sessionID, startRound)
+
 	ch := rt.Emitter().Subscribe()
 
-	// Run investigation in a goroutine; signal completion via channel.
 	errCh := make(chan error, 1)
 	go func() {
 		err := investigation.RunInvestigation(
 			rt.Ctx(), rt.Log(), rt.Planner(), rt.Exec(), rt.Compressor(),
 			s.store, sessionID, query, containerPcapPath, startRound, endRound,
+			collector.collectRound,
 		)
-		rt.Emitter().Close() // closes subscriber channels
+		rt.Emitter().Close()
 		errCh <- err
 	}()
 
-	// Stream events to SSE + persist to DB.
+	// --- SSE streaming (no DB writes) ---
 	seq := 0
 	keepAlive := time.NewTicker(15 * time.Second)
 	defer keepAlive.Stop()
@@ -136,40 +130,49 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-r.Context().Done():
-			_ = s.store.UpdateSessionStatus(context.Background(), sessionID, "cancelled")
+			// Client disconnected — do NOT flush to DB.
 			return
+
 		case <-keepAlive.C:
 			sse.writeComment("keepalive")
+
 		case ev, ok := <-ch:
 			if !ok {
+				// Investigation finished — determine outcome.
 				runErr := <-errCh
 				status := "completed"
 				if runErr != nil {
 					status = "error"
 					sseError(sse, "investigation", runErr.Error())
 				}
-				// Emit analysis.completed before closing.
+
+				// Emit analysis.completed as final buffered event.
 				seq++
 				acData := marshalJSON(events.AnalysisData{
 					SessionID:   sessionID,
 					TotalRounds: endRound,
 				})
-				_ = s.store.SaveEvent(context.Background(), sessionID, seq, events.TypeAnalysisCompleted, acData)
+				collector.bufferEvent(seq, events.TypeAnalysisCompleted, acData)
 				sse.writeEvent(seq, events.TypeAnalysisCompleted, acData)
 
-				_ = s.store.UpdateSessionStatus(context.Background(), sessionID, status)
+				// Flush accumulated data to DB atomically.
+				if flushErr := collector.flush(context.Background(), s.store, query, status); flushErr != nil {
+					log.Error(ctx, "flush to DB failed", logger.A(logger.AttrError, flushErr.Error()))
+				}
+
 				sse.writeEvent(0, "done", marshalJSON(map[string]string{
 					"session_id": sessionID,
 					"status":     status,
 				}))
 				return
 			}
+
 			seq++
 			data := "{}"
 			if ev.Data != nil {
 				data = string(ev.Data)
 			}
-			_ = s.store.SaveEvent(context.Background(), sessionID, seq, ev.Type, data)
+			collector.bufferEvent(seq, ev.Type, data)
 			sse.writeEvent(seq, ev.Type, data)
 		}
 	}

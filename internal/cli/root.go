@@ -2,6 +2,8 @@ package cli
 
 import (
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/Pcapchu/Pcapchu/internal/storage"
 	"github.com/spf13/cobra"
@@ -35,4 +37,16 @@ func Execute() {
 
 func openStore() (*storage.Store, error) {
 	return storage.New(dbPath)
+}
+
+// trapSignals starts a goroutine that calls cleanup on receipt of a
+// termination signal (SIGINT, SIGTERM, SIGQUIT). Combined with
+// defer cleanup(), this gives double-insurance that resources are released.
+func trapSignals(cleanup func()) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	go func() {
+		<-ch
+		cleanup()
+	}()
 }

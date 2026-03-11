@@ -52,9 +52,6 @@ func (s *Server) routes() {
 	// Analysis (SSE — response is text/event-stream)
 	s.mux.HandleFunc("POST /api/sessions/{id}/analyze", s.handleAnalyze)
 
-	// Event history (JSON)
-	s.mux.HandleFunc("GET /api/sessions/{id}/events", s.handleEvents)
-
 	// Session CRUD
 	s.mux.HandleFunc("GET /api/sessions", s.handleListSessions)
 	s.mux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
@@ -65,8 +62,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/pcap", s.handleListPcap)
 	s.mux.HandleFunc("DELETE /api/pcap/{id}", s.handleDeletePcap)
 
-	// Re-attach pcap to session
-	s.mux.HandleFunc("PATCH /api/sessions/{id}/pcap", s.handleReattachPcap)
 
 	// Serve embedded frontend (SPA with fallback to index.html)
 	s.mux.Handle("/", spaHandler())
@@ -76,7 +71,7 @@ func (s *Server) routes() {
 func (s *Server) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Last-Event-ID")
 		w.Header().Set("Access-Control-Expose-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {

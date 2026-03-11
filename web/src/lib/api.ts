@@ -1,6 +1,5 @@
 import type {
   UploadResponse,
-  ReattachResponse,
   Session,
   SessionDetail,
   PcapFile,
@@ -39,20 +38,6 @@ export async function deletePcapFile(id: number): Promise<void> {
   await fetch(`${BASE}/api/pcap/${id}`, { method: "DELETE" });
 }
 
-export async function reattachPcap(
-  sessionId: string,
-  pcapId: number
-): Promise<ReattachResponse> {
-  return fetchJSON<ReattachResponse>(
-    `/api/sessions/${encodeURIComponent(sessionId)}/pcap`,
-    {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pcap_id: pcapId }),
-    }
-  );
-}
-
 // --- Sessions ---
 
 export async function listSessions(): Promise<Session[]> {
@@ -70,28 +55,6 @@ export async function deleteSession(sessionId: string): Promise<void> {
   await fetch(`${BASE}/api/sessions/${encodeURIComponent(sessionId)}`, {
     method: "DELETE",
   });
-}
-
-// --- Event History ---
-
-export async function loadSessionEvents(
-  sessionId: string
-): Promise<SSEEvent[]> {
-  const body = await fetchJSON<{
-    session_id: string;
-    events: Array<{
-      seq: number;
-      type: string;
-      data: Record<string, unknown>;
-      timestamp: string;
-    }>;
-  }>(`/api/sessions/${encodeURIComponent(sessionId)}/events`);
-  return body.events.map((e) => ({
-    seq: e.seq,
-    type: e.type as EventType,
-    data: e.data,
-    timestamp: e.timestamp,
-  }));
 }
 
 // --- Analysis (SSE via fetch + ReadableStream) ---

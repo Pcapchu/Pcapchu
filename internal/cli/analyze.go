@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/Pcapchu/Pcapchu/internal/events"
 	"github.com/Pcapchu/Pcapchu/internal/investigation"
@@ -41,7 +42,6 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer store.Close()
 
 	// Resume existing session?
 	if analyzeSession != "" {
@@ -50,22 +50,33 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 
 	// New session requires --pcap.
 	if analyzePcap == "" {
+		store.Close()
 		return fmt.Errorf("--pcap is required (or use --session to resume)")
 	}
 
 	absPath, err := filepath.Abs(analyzePcap)
 	if err != nil {
+		store.Close()
 		return fmt.Errorf("resolve pcap path: %w", err)
 	}
 	if _, err := os.Stat(absPath); err != nil {
+		store.Close()
 		return fmt.Errorf("pcap file not accessible: %w", err)
 	}
 
 	rt, err := newCLIRuntime(context.Background())
 	if err != nil {
+		store.Close()
 		return err
 	}
-	defer rt.Close()
+
+	// Unified cleanup: container + DB + OTel, protected by once.
+	cleanup := sync.OnceFunc(func() {
+		rt.Close()
+		store.Close()
+	})
+	defer cleanup()
+	trapSignals(cleanup)
 
 	sessionID := uuid.New().String()
 
@@ -82,7 +93,7 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 
 	var sess storage.Session
 	sess.ID = sessionID
-	sess.UserQuery = analyzeQuery
+	sess.SessionTitle = analyzeQuery
 	sess.PcapFileID = storage.NullInt64(pcapID)
 
 	rt.Log().Emit(events.TypePcapLoaded, events.PcapLoadedData{
@@ -114,8 +125,12 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 		TotalRounds: analyzeRounds,
 	})
 
+	saveRound := func(ctx context.Context, r storage.Round) error {
+		return store.SaveRound(ctx, sessionID, r)
+	}
+
 	rt.SetUserQuery(analyzeQuery)
-	if err := investigation.RunInvestigation(rt.Ctx(), rt.Log(), rt.Planner(), rt.Exec(), rt.Compressor(), store, sessionID, analyzeQuery, containerPcapPath, 1, analyzeRounds); err != nil {
+	if err := investigation.RunInvestigation(rt.Ctx(), rt.Log(), rt.Planner(), rt.Exec(), rt.Compressor(), store, sessionID, analyzeQuery, containerPcapPath, 1, analyzeRounds, saveRound); err != nil {
 		return err
 	}
 
@@ -132,16 +147,24 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 func resumeSession(store *storage.Store, sessionID, queryOverride string, rounds int) error {
 	rt, err := newCLIRuntime(context.Background())
 	if err != nil {
+		store.Close()
 		return err
 	}
-	defer rt.Close()
+
+	// Unified cleanup: container + DB + OTel, protected by once.
+	cleanup := sync.OnceFunc(func() {
+		rt.Close()
+		store.Close()
+	})
+	defer cleanup()
+	trapSignals(cleanup)
 
 	sess, err := store.GetSession(rt.Ctx(), sessionID)
 	if err != nil {
 		return fmt.Errorf("load session: %w", err)
 	}
 
-	query := sess.UserQuery
+	query := sess.SessionTitle
 	if queryOverride != "" && queryOverride != "Analyze this pcap file and identify any security concerns." {
 		query = queryOverride
 	}
@@ -169,8 +192,12 @@ func resumeSession(store *storage.Store, sessionID, queryOverride string, rounds
 		TotalRounds: endRound,
 	})
 
+	saveRound := func(ctx context.Context, r storage.Round) error {
+		return store.SaveRound(ctx, sessionID, r)
+	}
+
 	rt.SetUserQuery(query)
-	if err := investigation.RunInvestigation(rt.Ctx(), rt.Log(), rt.Planner(), rt.Exec(), rt.Compressor(), store, sessionID, query, containerPcapPath, startRound, endRound); err != nil {
+	if err := investigation.RunInvestigation(rt.Ctx(), rt.Log(), rt.Planner(), rt.Exec(), rt.Compressor(), store, sessionID, query, containerPcapPath, startRound, endRound, saveRound); err != nil {
 		return err
 	}
 

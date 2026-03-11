@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y \
     libgtest-dev \
     libgoogle-glog-dev \
     cmake \
+    xxd \
     && rm -rf /var/lib/apt/lists/*
 
 RUN localedef -i en_US -f UTF-8 en_US.UTF-8
@@ -58,7 +59,10 @@ RUN uv pip install \
     pandas \
     ipython \
     requests \
-    pytz
+    pytz \
+    pycryptodome \
+    cryptography \
+    ecdsa
 
 RUN git clone https://github.com/Pcapchu/pcapchu-scripts.git /home/linuxbrew/pcapchu-scripts && \
     uv pip install /home/linuxbrew/pcapchu-scripts/

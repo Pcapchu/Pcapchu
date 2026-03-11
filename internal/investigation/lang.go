@@ -28,9 +28,15 @@ func (m *LangHintModifier) SetQuery(query string) {
 }
 
 // Rewrite is a MessageRewriter-compatible function that prepends the
-// language hint as a system message.
+// language hint to the first message if available, or as a system message.
 func (m *LangHintModifier) Rewrite(_ context.Context, msgs []*schema.Message) []*schema.Message {
 	if m.hint == "" {
+		return msgs
+	}
+
+	if len(msgs) > 0 {
+
+		msgs[0].Content = m.hint + "\n\n" + msgs[0].Content
 		return msgs
 	}
 	out := make([]*schema.Message, 0, len(msgs)+1)

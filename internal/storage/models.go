@@ -19,7 +19,7 @@ type PcapFile struct {
 // Exactly one of PcapFileID or PcapPath is non-nil.
 type Session struct {
 	ID              string         `db:"id"`
-	UserQuery       string         `db:"user_query"`
+	SessionTitle    string         `db:"session_title"`
 	PcapFileID      sql.NullInt64  `db:"pcap_file_id"`
 	PcapPath        sql.NullString `db:"pcap_path"`
 	FindingsSummary string         `db:"findings_summary"`
@@ -34,6 +34,7 @@ type Round struct {
 	ID               int64     `db:"id"`
 	SessionID        string    `db:"session_id"`
 	Round            int       `db:"round"`
+	UserQuery        string    `db:"user_query"`
 	ResearchFindings string    `db:"research_findings"`
 	OperationLog     string    `db:"operation_log"`
 	Summary          string    `db:"summary"`
@@ -48,14 +49,14 @@ type Round struct {
 
 // SessionListItem is a projection used by ListSessions.
 type SessionListItem struct {
-	ID         string         `db:"id"`
-	UserQuery  string         `db:"user_query"`
-	RoundCount int            `db:"round_count"`
-	Status     string         `db:"status"`
-	PcapFileID sql.NullInt64  `db:"pcap_file_id"`
-	PcapPath   sql.NullString `db:"pcap_path"`
-	CreatedAt  time.Time      `db:"created_at"`
-	UpdatedAt  time.Time      `db:"updated_at"`
+	ID           string         `db:"id"`
+	SessionTitle string         `db:"session_title"`
+	RoundCount   int            `db:"round_count"`
+	Status       string         `db:"status"`
+	PcapFileID   sql.NullInt64  `db:"pcap_file_id"`
+	PcapPath     sql.NullString `db:"pcap_path"`
+	CreatedAt    time.Time      `db:"created_at"`
+	UpdatedAt    time.Time      `db:"updated_at"`
 }
 
 // PcapSource returns a human-readable string describing where the pcap lives.
@@ -89,12 +90,24 @@ type HistorySnapshot struct {
 	CreatedAt      time.Time `db:"created_at"`
 }
 
-// SessionEvent stores a single event emitted during a session, for SSE replay.
+// SessionEvent represents a row in the session_events table.
 type SessionEvent struct {
 	ID        int64     `db:"id"`
 	SessionID string    `db:"session_id"`
 	Seq       int       `db:"seq"`
+	Round     int       `db:"round"`
 	EventType string    `db:"event_type"`
 	Data      string    `db:"data"`
 	CreatedAt time.Time `db:"created_at"`
 }
+
+// RoundQuery represents a row in the round_queries table.
+type RoundQuery struct {
+	ID        int64     `db:"id"`
+	SessionID string    `db:"session_id"`
+	Round     int       `db:"round"`
+	UserQuery string    `db:"user_query"`
+	CreatedAt time.Time `db:"created_at"`
+}
+
+

@@ -3,9 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
-	"os/signal"
 	"sync"
-	"syscall"
 
 	"github.com/Pcapchu/Pcapchu/internal/events"
 	"github.com/Pcapchu/Pcapchu/internal/investigation"
@@ -13,7 +11,8 @@ import (
 )
 
 // cliRuntime wraps an investigation.Runtime with CLI-specific concerns:
-// signal handling, OTel setup, and an event-printing goroutine.
+// OTel setup and an event-printing goroutine.
+// Caller is responsible for signal handling — see trapSignals().
 type cliRuntime struct {
 	*investigation.Runtime
 	otelShutdown func(context.Context)
@@ -21,18 +20,15 @@ type cliRuntime struct {
 }
 
 // newCLIRuntime creates a Runtime suitable for CLI invocations.
-// It adds SIGINT/SIGTERM handling and an OTel sink if configured.
+// It sets up OTel, the event emitter, and an event-printing goroutine,
+// but does NOT register signal handlers — the caller should use
+// sync.OnceFunc + trapSignals for that.
 func newCLIRuntime(parentCtx context.Context) (*cliRuntime, error) {
-	ctx, cancel := signal.NotifyContext(parentCtx, syscall.SIGINT, syscall.SIGTERM)
-
-	// --- Build the top-level logger (single instance for the CLI process) ---
-	parentLog, otelShutdown, err := logger.NewDefaultLogger(ctx, "pcapchu")
+	parentLog, otelShutdown, err := logger.NewDefaultLogger(parentCtx, "pcapchu")
 	if err != nil {
-		cancel()
 		return nil, fmt.Errorf("init logger: %w", err)
 	}
 
-	// --- Create emitter + wire logger's EmitFunc to it ---
 	emitter := events.NewChannelEmitter(1024)
 	log := logger.NewLogger().
 		WithSink(parentLog.Sink()).
@@ -40,15 +36,15 @@ func newCLIRuntime(parentCtx context.Context) (*cliRuntime, error) {
 			emitter.Emit(events.NewEvent(eventType, "", data))
 		})
 
-	// --- Create the investigation runtime ---
-	rt, err := investigation.NewRuntime(ctx, log, emitter)
+	rt, err := investigation.NewRuntime(parentCtx, log, emitter)
 	if err != nil {
-		cancel()
-		emitter.Close()
+		if otelShutdown != nil {
+			otelShutdown(context.Background())
+		}
 		return nil, err
 	}
 
-	// --- Event printer goroutine (CLI console feedback) ---
+	// Event printer goroutine (CLI console feedback).
 	ch := rt.Emitter().Subscribe()
 	go func() {
 		for ev := range ch {
@@ -58,20 +54,13 @@ func newCLIRuntime(parentCtx context.Context) (*cliRuntime, error) {
 
 	logger.SetDefault(rt.Log())
 
-	crt := &cliRuntime{
+	return &cliRuntime{
 		Runtime:      rt,
 		otelShutdown: otelShutdown,
-	}
-
-	// Ensure cleanup on signal (Close is Once-guarded so double-close is safe).
-	go func() {
-		<-ctx.Done()
-		crt.Close()
-	}()
-
-	return crt, nil
+	}, nil
 }
 
+// Close tears down the runtime. Safe to call multiple times.
 func (r *cliRuntime) Close() {
 	r.cleanupOnce.Do(func() {
 		r.Runtime.Close()

@@ -5,12 +5,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	sbx "github.com/Pcapchu/Pcapchu/sandbox"
 	"io"
 	"os"
 	"path/filepath"
 	"unsafe"
-
-	sbx "github.com/Pcapchu/Pcapchu/sandbox"
 
 	"github.com/cloudwego/eino-ext/components/tool/commandline"
 	"github.com/cloudwego/eino-ext/components/tool/commandline/sandbox"
@@ -66,6 +65,7 @@ func dockerInternals(ds *sandbox.DockerSandbox) (*client.Client, string) {
 // NewDockerEnv creates and starts a Docker-based environment.
 func NewDockerEnv(ctx context.Context) (*DockerEnv, error) {
 	imageName := sbx.ImageName()
+	//imageName := "net-analyzer-v5:latest"
 
 	// Check if the image exists locally; if not, offer to pull it.
 	if err := ensureImage(ctx, imageName); err != nil {

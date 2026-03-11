@@ -14,8 +14,6 @@ CORS is enabled for all origins (`*`).
 - [Lifecycle](#lifecycle)
 - [Analysis (SSE)](#analysis-sse)
   - [POST /api/sessions/{id}/analyze](#post-apisessionsidanalyze)
-- [Event History (JSON)](#event-history-json)
-  - [GET /api/sessions/{id}/events](#get-apisessionsidevents)
 - [Session Management](#session-management)
   - [GET /api/sessions](#get-apisessions)
   - [GET /api/sessions/{id}](#get-apisessionsid)
@@ -24,7 +22,6 @@ CORS is enabled for all origins (`*`).
   - [POST /api/pcap/upload](#post-apipcapupload)
   - [GET /api/pcap](#get-apipcap)
   - [DELETE /api/pcap/{id}](#delete-apipcapid)
-  - [PATCH /api/sessions/{id}/pcap](#patch-apisessionsidpcap)
 - [Event Types](#event-types)
 - [Session Status](#session-status)
 
@@ -45,9 +42,11 @@ curl -X POST http://localhost:8080/api/pcap/upload \
 curl -N -X POST http://localhost:8080/api/sessions/abc-123/analyze \
   -H "Content-Type: application/json" \
   -d '{"query":"Find security threats"}'
-# → event: analysis.started
-# → data: {"session_id":"abc-123","total_rounds":1}
+# → event: session.created
+# → data: {"session_id":"abc-123","user_query":"Find security threats","pcap_source":"db"}
 # → ...
+# → event: analysis.completed
+# → data: {"session_id":"abc-123","total_rounds":1}
 # → event: done
 # → data: {"session_id":"abc-123","status":"completed"}
 
@@ -56,8 +55,8 @@ curl -N -X POST http://localhost:8080/api/sessions/abc-123/analyze \
   -H "Content-Type: application/json" \
   -d '{"query":"Focus on DNS tunneling"}'
 
-# 5. Retrieve history for a past session
-curl http://localhost:8080/api/sessions/abc-123/events
+# 5. Retrieve session detail with per-round history
+curl http://localhost:8080/api/sessions/abc-123
 ```
 
 ---
@@ -69,10 +68,16 @@ The frontend workflow is:
 1. **Upload pcap** → `POST /api/pcap/upload` → returns `session_id`
 2. **Start analysis** → `POST /api/sessions/{id}/analyze` → SSE stream
 3. **Continue (more rounds)** → same endpoint → SSE stream
+4. **Load history** → `GET /api/sessions/{id}` → rounds with events
 
 Each analysis request is **self-contained** — the POST response is an SSE
 stream that stays open until the investigation completes (or the client
 disconnects). There is no global server state tracking running investigations.
+
+**Transactional persistence**: No data is written to the database during
+the SSE stream. A `txCollector` buffers all events and round results in
+memory. Only on successful completion (or error) is the data flushed
+atomically. If the client disconnects mid-stream, nothing is persisted.
 
 ```
 POST /api/pcap/upload
@@ -87,9 +92,14 @@ POST /api/sessions/{id}/analyze  (SSE response)
        ├── Auto-detect first-run vs continuation (by round count)
        ├── Create Runtime (Docker sandbox, LLM, agents)
        ├── Copy pcap from DB to container
+       ├── Emit session.created / session.resumed
        ├── Planner → Executor loop (per round)
-       │      ├── Events streamed to SSE client
-       │      └── Events persisted to DB (session_events)
+       │      └── Events streamed to SSE client (buffered in memory)
+       ├── On completion: flush all data to DB atomically
+       │      ├── session_events (tagged with round number)
+       │      ├── rounds table
+       │      ├── round_queries table
+       │      └── session title + status
        ├── analysis.completed / error
        ├── Docker sandbox cleaned up
        └── SSE sends "done" event → connection closes
@@ -100,16 +110,17 @@ Key design:
 - **One Runtime per request** — each analysis request creates its own
   `investigation.Runtime` (same as CLI), runs the investigation
   synchronously within the SSE response, then tears down.
+- **Atomic persistence** — nothing is written to the database during the
+  SSE stream. A `txCollector` buffers events and round data, flushing
+  everything on completion. Client disconnect = no partial state.
 - **Client disconnect = cancel** — when the client closes the connection,
   `r.Context()` is cancelled, which propagates to the runtime and triggers
-  Docker cleanup.
+  Docker cleanup. No data is persisted.
 - **No global state** — there is no runner, no active session map, no
   goroutine pool. Each request is fully independent.
 - **Unified endpoint** — `POST /api/sessions/{id}/analyze` handles both
   first analysis and continuation. It auto-detects by counting existing
   rounds in the DB.
-- **History via JSON** — `GET /sessions/{id}/events` returns all persisted
-  events. SSE is for live streaming only.
 
 ---
 
@@ -119,8 +130,7 @@ Key design:
 
 Start or continue an investigation on an existing session and stream events
 via SSE. Each call runs exactly **one round**. The session must already have
-a pcap attached (created via `POST /api/pcap/upload` or re-attached via
-`PATCH /api/sessions/{id}/pcap`).
+a pcap attached (created via `POST /api/pcap/upload`).
 
 The start round is auto-detected by counting existing rounds in the database.
 Call this endpoint repeatedly to run additional rounds.
@@ -138,20 +148,24 @@ Call this endpoint repeatedly to run additional rounds.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `query` | string | No | Analysis query (overrides session's original query) |
+| `query` | string | **Yes** | Analysis query for this round |
 
 #### Response — SSE stream
 
 ```
 id: 1
-event: analysis.started
-data: {"session_id":"abc-123","total_rounds":1}
+event: session.created
+data: {"session_id":"abc-123","user_query":"Find security threats","pcap_source":"db"}
 
 id: 2
 event: round.started
-data: {"round":1,"total_rounds":2}
+data: {"round":1,"total_rounds":1}
 
 ...
+
+id: 25
+event: analysis.completed
+data: {"session_id":"abc-123","total_rounds":1}
 
 event: done
 data: {"session_id":"abc-123","status":"completed"}
@@ -160,47 +174,25 @@ data: {"session_id":"abc-123","status":"completed"}
 The stream closes after the `done` event. If an error occurs, an `error`
 event is sent before `done`.
 
+On first analysis (`round == 1`), a `session.created` event is emitted.
+On continuation (`round > 1`), a `session.resumed` event is emitted.
+
 #### Cancellation
 
 Close the HTTP connection to cancel the investigation. The server will:
 1. Cancel the runtime context
 2. Clean up the Docker sandbox
-3. Set session status to `"cancelled"`
+3. **Not persist any data** (no partial state in DB)
 
 #### Errors
 
 | Status | Reason |
 |---|---|
-| 400 | Invalid JSON / session has no pcap attached |
+| 400 | Invalid JSON / empty query / session has no pcap attached |
 | 404 | Session not found |
 | 500 | Streaming not supported |
 
 Errors after SSE has started are delivered as `error` events in the stream.
-
----
-
-## Event History (JSON)
-
-### GET /api/sessions/{id}/events
-
-Returns all stored events for a session as a JSON array.
-Use this to load history when entering a session view.
-
-#### Response — 200 OK
-
-```json
-{
-  "session_id": "abc-123",
-  "events": [
-    {
-      "seq": 1,
-      "type": "analysis.started",
-      "data": {"session_id":"abc-123","total_rounds":2},
-      "timestamp": "2026-03-09T10:00:01Z"
-    }
-  ]
-}
-```
 
 ---
 
@@ -217,7 +209,7 @@ List all sessions.
   "sessions": [
     {
       "id": "abc-123",
-      "user_query": "Find security threats",
+      "session_title": "Find security threats",
       "round_count": 2,
       "status": "completed",
       "pcap_source": "db",
@@ -228,36 +220,52 @@ List all sessions.
 }
 ```
 
-`status` is read directly from the database.
+`session_title` is set from the first round's query. `status` is read
+directly from the database.
 
 ---
 
 ### GET /api/sessions/{id}
 
-Get a single session with its investigation rounds.
+Get a single session with its investigation history organized by round.
+Each round contains the user query for that round and all events that
+occurred during it.
 
 #### Response — 200 OK
 
 ```json
 {
   "id": "abc-123",
-  "user_query": "Find security threats",
+  "session_title": "Find security threats",
   "status": "completed",
   "round_count": 2,
   "rounds": [
     {
       "round": 1,
-      "summary": "Found suspicious DNS queries...",
-      "key_findings": "- DNS tunneling detected\n- ...",
-      "open_questions": "Need to examine payload...",
-      "markdown_report": "### \ud83c\udfaf Investigation Objectives ...\n\n...",
-      "created_at": "2026-03-09T10:02:00Z"
+      "user_query": "Find security threats",
+      "events": [
+        {
+          "seq": 1,
+          "type": "session.created",
+          "data": {"session_id":"abc-123","user_query":"Find security threats","pcap_source":"db"},
+          "timestamp": "2026-03-09T10:00:01Z"
+        },
+        {
+          "seq": 2,
+          "type": "round.started",
+          "data": {"round":1,"total_rounds":1},
+          "timestamp": "2026-03-09T10:00:02Z"
+        }
+      ]
     }
   ],
   "created_at": "2026-03-09T10:00:00Z",
   "updated_at": "2026-03-09T10:05:00Z"
 }
 ```
+
+Events within each round are ordered by `seq`. The `user_query` field on
+each round comes from the `round_queries` table.
 
 #### Errors
 
@@ -269,7 +277,7 @@ Get a single session with its investigation rounds.
 
 ### DELETE /api/sessions/{id}
 
-Delete a session and all associated data (rounds, events, snapshots).
+Delete a session and all associated data (rounds, events, snapshots, queries).
 
 #### Response — 204 No Content
 
@@ -338,8 +346,7 @@ List all stored pcap files (metadata only, no blob data).
 ### DELETE /api/pcap/{id}
 
 Remove a stored pcap file. Sessions referencing this pcap will have their
-`pcap_file_id` set to NULL (SQL `ON DELETE SET NULL`). Those sessions can
-later have a new pcap re-attached via `PATCH /api/sessions/{id}/pcap`.
+`pcap_file_id` set to NULL (SQL `ON DELETE SET NULL`).
 
 #### Response — 204 No Content
 
@@ -351,60 +358,15 @@ later have a new pcap re-attached via `PATCH /api/sessions/{id}/pcap`.
 
 ---
 
-### PATCH /api/sessions/{id}/pcap
-
-Re-attach a pcap file to an existing session. Useful after deleting a pcap
-and re-uploading a replacement, or pointing a session at a different pcap.
-
-**Content-Type:** `multipart/form-data` or `application/json`
-
-#### Option A: Upload new file
-
-```
-PATCH /api/sessions/abc-123/pcap
-Content-Type: multipart/form-data
-[file field: the pcap file]
-```
-
-The file is stored in SQLite (SHA-256 deduped) and bound to the session.
-
-#### Option B: Bind existing stored pcap
-
-```json
-{
-  "pcap_id": 1
-}
-```
-
-#### Response — 200 OK
-
-```json
-{
-  "session_id": "abc-123",
-  "pcap_id": 1
-}
-```
-
-#### Errors
-
-| Status | Reason |
-|---|---|
-| 400 | Missing pcap_id / invalid JSON |
-| 404 | Session or pcap not found |
-
----
-
 ## Event Types
 
 Events emitted during an investigation, available via SSE stream and
-the `/events` endpoint.
+the session detail endpoint.
 
 | Type | Data Fields | Description |
 |---|---|---|
-| `session.created` | session_id, user_query, pcap_source | Session initialized |
-| `session.resumed` | session_id, from_round | Session continued |
-| `analysis.started` | session_id, total_rounds | Investigation loop started |
-| `analysis.completed` | session_id, total_rounds | Investigation loop finished |
+| `session.created` | session_id, user_query, pcap_source | Session initialized (round 1) |
+| `session.resumed` | session_id, from_round | Session continued (round 2+) |
 | `pcap.loaded` | source, path, size, filename | Pcap copied to sandbox |
 | `round.started` | round, total_rounds | Round N begins |
 | `round.completed` | round, summary, key_findings, markdown_report | Round N finished |
@@ -415,9 +377,10 @@ the `/events` endpoint.
 | `step.completed` | step_id, total_steps | Executor step finished |
 | `step.error` | phase, message, step_id? | Executor step failed |
 | `report.generated` | round, report, markdown_report, content_length, total_steps, duration_ms | Round summary generated |
+| `analysis.completed` | session_id, total_rounds | Investigation loop finished |
 | `info` | message | General info message |
 | `error` | phase, message, step_id? | General error |
-| `done` | *(empty)* | SSE-only: investigation finished, stream closing |
+| `done` | session_id, status | SSE-only: investigation finished, stream closing |
 
 ---
 
@@ -429,5 +392,4 @@ the `/events` endpoint.
 | `running` | Investigation in progress |
 | `completed` | All rounds finished successfully |
 | `error` | Investigation failed with an error |
-| `cancelled` | Explicitly cancelled by user |
-| `interrupted` | Server restarted while investigation was running |
+| `cancelled` | Client disconnected during investigation |

@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS pcap_files (
 
 CREATE TABLE IF NOT EXISTS sessions (
     id               TEXT PRIMARY KEY,
-    user_query       TEXT NOT NULL,
+    session_title    TEXT NOT NULL DEFAULT '',
     pcap_file_id     INTEGER REFERENCES pcap_files(id) ON DELETE SET NULL,
     pcap_path        TEXT,
     findings_summary TEXT NOT NULL DEFAULT '',
@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS rounds (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id        TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     round             INTEGER NOT NULL,
+    user_query        TEXT NOT NULL DEFAULT '',
     research_findings TEXT NOT NULL DEFAULT '',
     operation_log     TEXT NOT NULL DEFAULT '',
     summary           TEXT NOT NULL DEFAULT '',
@@ -68,14 +69,24 @@ CREATE TABLE IF NOT EXISTS history_snapshots (
     UNIQUE(session_id, scope)
 );
 
+CREATE TABLE IF NOT EXISTS round_queries (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    round      INTEGER NOT NULL,
+    user_query TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(session_id, round)
+);
+
 CREATE TABLE IF NOT EXISTS session_events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     seq        INTEGER NOT NULL,
+    round      INTEGER NOT NULL DEFAULT 0,
     event_type TEXT NOT NULL,
     data       TEXT NOT NULL DEFAULT '{}',
     created_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(session_id, seq)
+    UNIQUE(session_id, round, seq)
 );
 `
 
@@ -83,6 +94,8 @@ CREATE TABLE IF NOT EXISTS session_events (
 const migrations = `
 ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'idle';
 ALTER TABLE rounds ADD COLUMN markdown_report TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions RENAME COLUMN user_query TO session_title;
+ALTER TABLE rounds ADD COLUMN user_query TEXT NOT NULL DEFAULT '';
 `
 
 // New opens (or creates) the SQLite database at path and initialises the schema.
@@ -106,6 +119,11 @@ func New(path string) (*Store, error) {
 			_, _ = db.Exec(stmt)
 		}
 	}
+
+	// One-time fix: if session_events has the old UNIQUE(session_id, seq)
+	// constraint (missing round), rebuild it with the correct one.
+	migrateSessionEventsConstraint(db)
+
 	return &Store{db: db}, nil
 }
 
@@ -193,9 +211,9 @@ func (s *Store) DeletePcapFile(ctx context.Context, id int64) error {
 func (s *Store) CreateSession(ctx context.Context, sess Session) error {
 	now := time.Now().UTC()
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO sessions (id, user_query, pcap_file_id, pcap_path, created_at, updated_at)
+		`INSERT INTO sessions (id, session_title, pcap_file_id, pcap_path, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
-		sess.ID, sess.UserQuery, sess.PcapFileID, sess.PcapPath, now, now)
+		sess.ID, sess.SessionTitle, sess.PcapFileID, sess.PcapPath, now, now)
 	if err != nil {
 		return fmt.Errorf("create session: %w", err)
 	}
@@ -206,7 +224,7 @@ func (s *Store) CreateSession(ctx context.Context, sess Session) error {
 func (s *Store) GetSession(ctx context.Context, id string) (*Session, error) {
 	var sess Session
 	if err := s.db.GetContext(ctx, &sess,
-		`SELECT id, user_query, pcap_file_id, pcap_path, findings_summary, report_summary, status, created_at, updated_at
+		`SELECT id, session_title, pcap_file_id, pcap_path, findings_summary, report_summary, status, created_at, updated_at
 		 FROM sessions WHERE id = ?`, id); err != nil {
 		return nil, fmt.Errorf("get session: %w", err)
 	}
@@ -217,7 +235,7 @@ func (s *Store) GetSession(ctx context.Context, id string) (*Session, error) {
 func (s *Store) ListSessions(ctx context.Context) ([]SessionListItem, error) {
 	var items []SessionListItem
 	if err := s.db.SelectContext(ctx, &items, `
-		SELECT s.id, s.user_query, s.status, s.pcap_file_id, s.pcap_path,
+		SELECT s.id, s.session_title, s.status, s.pcap_file_id, s.pcap_path,
 		       s.created_at, s.updated_at,
 		       COALESCE(r.cnt, 0) AS round_count
 		FROM sessions s
@@ -256,25 +274,6 @@ func (s *Store) TouchSession(ctx context.Context, id string) error {
 	return nil
 }
 
-// UpdateSessionPcap re-attaches a pcap file to a session by pcap_file_id.
-// Pass 0 to clear the pcap reference and use pcapPath instead.
-func (s *Store) UpdateSessionPcap(ctx context.Context, sessionID string, pcapFileID int64, pcapPath string) error {
-	now := time.Now().UTC()
-	var err error
-	if pcapFileID > 0 {
-		_, err = s.db.ExecContext(ctx,
-			`UPDATE sessions SET pcap_file_id = ?, pcap_path = NULL, updated_at = ? WHERE id = ?`,
-			pcapFileID, now, sessionID)
-	} else {
-		_, err = s.db.ExecContext(ctx,
-			`UPDATE sessions SET pcap_file_id = NULL, pcap_path = ?, updated_at = ? WHERE id = ?`,
-			pcapPath, now, sessionID)
-	}
-	if err != nil {
-		return fmt.Errorf("update session pcap: %w", err)
-	}
-	return nil
-}
 
 // ===================================================================
 // Rounds
@@ -284,14 +283,13 @@ func (s *Store) UpdateSessionPcap(ctx context.Context, sessionID string, pcapFil
 func (s *Store) SaveRound(ctx context.Context, sessionID string, r Round) error {
 	now := time.Now().UTC()
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO rounds (session_id, round, research_findings, operation_log, summary, key_findings, open_questions, markdown_report, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		sessionID, r.Round, r.ResearchFindings, r.OperationLog,
+		`INSERT INTO rounds (session_id, round, user_query, research_findings, operation_log, summary, key_findings, open_questions, markdown_report, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sessionID, r.Round, r.UserQuery, r.ResearchFindings, r.OperationLog,
 		r.Summary, r.KeyFindings, r.OpenQuestions, r.MarkdownReport, now)
 	if err != nil {
 		return fmt.Errorf("save round: %w", err)
 	}
-	// Keep session timestamp fresh.
 	_ = s.TouchSession(ctx, sessionID)
 	return nil
 }
@@ -429,52 +427,12 @@ func (s *Store) LoadSnapshot(ctx context.Context, sessionID, scope string) (*His
 func (s *Store) LoadRoundsAfter(ctx context.Context, sessionID string, afterRound int) ([]Round, error) {
 	var rounds []Round
 	if err := s.db.SelectContext(ctx, &rounds,
-		`SELECT round, research_findings, operation_log, summary, key_findings, open_questions, markdown_report
+		`SELECT round, user_query, research_findings, operation_log, summary, key_findings, open_questions, markdown_report
 		 FROM rounds WHERE session_id = ? AND round > ? ORDER BY round ASC`,
 		sessionID, afterRound); err != nil {
 		return nil, fmt.Errorf("load rounds after %d: %w", afterRound, err)
 	}
 	return rounds, nil
-}
-
-// ===================================================================
-// Session Events (for SSE replay)
-// ===================================================================
-
-// SaveEvent stores a single event for a session with monotonic sequence number.
-func (s *Store) SaveEvent(ctx context.Context, sessionID string, seq int, eventType, data string) error {
-	now := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO session_events (session_id, seq, event_type, data, created_at)
-		 VALUES (?, ?, ?, ?, ?)`,
-		sessionID, seq, eventType, data, now)
-	if err != nil {
-		return fmt.Errorf("save event: %w", err)
-	}
-	return nil
-}
-
-// LoadSessionEvents returns all events for a session, ordered by seq.
-func (s *Store) LoadSessionEvents(ctx context.Context, sessionID string) ([]SessionEvent, error) {
-	var evts []SessionEvent
-	if err := s.db.SelectContext(ctx, &evts,
-		`SELECT id, session_id, seq, event_type, data, created_at
-		 FROM session_events WHERE session_id = ? ORDER BY seq ASC`, sessionID); err != nil {
-		return nil, fmt.Errorf("load session events: %w", err)
-	}
-	return evts, nil
-}
-
-// LoadSessionEventsSince returns events with seq > afterSeq.
-func (s *Store) LoadSessionEventsSince(ctx context.Context, sessionID string, afterSeq int) ([]SessionEvent, error) {
-	var evts []SessionEvent
-	if err := s.db.SelectContext(ctx, &evts,
-		`SELECT id, session_id, seq, event_type, data, created_at
-		 FROM session_events WHERE session_id = ? AND seq > ? ORDER BY seq ASC`,
-		sessionID, afterSeq); err != nil {
-		return nil, fmt.Errorf("load events since seq %d: %w", afterSeq, err)
-	}
-	return evts, nil
 }
 
 // UpdateSessionStatus sets the status field for a session.
@@ -488,13 +446,13 @@ func (s *Store) UpdateSessionStatus(ctx context.Context, sessionID, status strin
 	return nil
 }
 
-// UpdateSessionQuery sets the user_query field for a session.
-func (s *Store) UpdateSessionQuery(ctx context.Context, sessionID, query string) error {
+// UpdateSessionTitle sets the session_title field.
+func (s *Store) UpdateSessionTitle(ctx context.Context, sessionID, title string) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE sessions SET user_query = ?, updated_at = ? WHERE id = ?`,
-		query, time.Now().UTC(), sessionID)
+		`UPDATE sessions SET session_title = ?, updated_at = ? WHERE id = ?`,
+		title, time.Now().UTC(), sessionID)
 	if err != nil {
-		return fmt.Errorf("update session query: %w", err)
+		return fmt.Errorf("update session title: %w", err)
 	}
 	return nil
 }
@@ -503,7 +461,7 @@ func (s *Store) UpdateSessionQuery(ctx context.Context, sessionID, query string)
 func (s *Store) LoadRounds(ctx context.Context, sessionID string) ([]Round, error) {
 	var rounds []Round
 	if err := s.db.SelectContext(ctx, &rounds,
-		`SELECT id, session_id, round, research_findings, operation_log, summary, key_findings, open_questions, markdown_report, compressed, created_at
+		`SELECT id, session_id, round, user_query, research_findings, operation_log, summary, key_findings, open_questions, markdown_report, compressed, created_at
 		 FROM rounds WHERE session_id = ? ORDER BY round ASC`, sessionID); err != nil {
 		return nil, fmt.Errorf("load rounds: %w", err)
 	}
@@ -511,8 +469,105 @@ func (s *Store) LoadRounds(ctx context.Context, sessionID string) ([]Round, erro
 }
 
 // ===================================================================
+// Session Events
+// ===================================================================
+
+// SaveEvents inserts a batch of events for the given session.
+func (s *Store) SaveEvents(ctx context.Context, sessionID string, evts []SessionEvent) error {
+	if len(evts) == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	for _, ev := range evts {
+		_, err := s.db.ExecContext(ctx,
+			`INSERT INTO session_events (session_id, seq, round, event_type, data, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			sessionID, ev.Seq, ev.Round, ev.EventType, ev.Data, now)
+		if err != nil {
+			return fmt.Errorf("save event seq %d: %w", ev.Seq, err)
+		}
+	}
+	return nil
+}
+
+// LoadSessionEvents returns all events for a session, ordered by seq.
+func (s *Store) LoadSessionEvents(ctx context.Context, sessionID string) ([]SessionEvent, error) {
+	var evts []SessionEvent
+	if err := s.db.SelectContext(ctx, &evts,
+		`SELECT id, session_id, seq, round, event_type, data, created_at
+		 FROM session_events WHERE session_id = ? ORDER BY seq ASC`, sessionID); err != nil {
+		return nil, fmt.Errorf("load session events: %w", err)
+	}
+	return evts, nil
+}
+
+// ===================================================================
+// Round Queries
+// ===================================================================
+
+// SaveRoundQuery records the user query for a specific round.
+func (s *Store) SaveRoundQuery(ctx context.Context, sessionID string, round int, query string) error {
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO round_queries (session_id, round, user_query, created_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(session_id, round) DO UPDATE SET user_query = excluded.user_query`,
+		sessionID, round, query, now)
+	if err != nil {
+		return fmt.Errorf("save round query: %w", err)
+	}
+	return nil
+}
+
+// LoadRoundQueries returns all round queries for a session, ordered by round.
+func (s *Store) LoadRoundQueries(ctx context.Context, sessionID string) ([]RoundQuery, error) {
+	var queries []RoundQuery
+	if err := s.db.SelectContext(ctx, &queries,
+		`SELECT id, session_id, round, user_query, created_at
+		 FROM round_queries WHERE session_id = ? ORDER BY round ASC`, sessionID); err != nil {
+		return nil, fmt.Errorf("load round queries: %w", err)
+	}
+	return queries, nil
+}
+
+// ===================================================================
 // Helpers
 // ===================================================================
+
+// migrateSessionEventsConstraint detects whether session_events has the old
+// UNIQUE(session_id, seq) constraint and, if so, rebuilds the table with
+// UNIQUE(session_id, round, seq). This is a one-time migration that preserves
+// existing data.
+func migrateSessionEventsConstraint(db *sqlx.DB) {
+	var createSQL string
+	err := db.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type='table' AND name='session_events'`,
+	).Scan(&createSQL)
+	if err != nil {
+		return // table doesn't exist yet or other error — DDL will create it
+	}
+
+	// If the CREATE statement already mentions "round, seq" the constraint is correct.
+	if strings.Contains(createSQL, "round, seq") || strings.Contains(createSQL, "round,seq") {
+		return
+	}
+
+	// Old constraint — rebuild.
+	_, _ = db.Exec(`ALTER TABLE session_events RENAME TO _session_events_old`)
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS session_events (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+		seq        INTEGER NOT NULL,
+		round      INTEGER NOT NULL DEFAULT 0,
+		event_type TEXT NOT NULL,
+		data       TEXT NOT NULL DEFAULT '{}',
+		created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+		UNIQUE(session_id, round, seq)
+	)`)
+	_, _ = db.Exec(`INSERT OR IGNORE INTO session_events (session_id, seq, round, event_type, data, created_at)
+		SELECT session_id, seq, round, event_type, data, created_at FROM _session_events_old`)
+	_, _ = db.Exec(`DROP TABLE IF EXISTS _session_events_old`)
+}
 
 func sha256Sum(data []byte) string {
 	h := sha256.Sum256(data)
