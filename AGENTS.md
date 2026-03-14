@@ -27,7 +27,7 @@ For a human-friendly overview, see [README.md](./README.md).
 
 ## Project Overview
 
-Pcapchu is an autonomous AI agent that investigates network packet captures.
+Pcapchu is an autonomous AI agent that investigates network packet captures using a **Multi-Agent Plan-Execute-Summarize architecture**.
 Given a pcap file and a natural-language query, it:
 
 1. Spins up an isolated Docker sandbox with Zeek, DuckDB, tshark, and Scapy.
@@ -37,6 +37,26 @@ Given a pcap file and a natural-language query, it:
 5. Persists session state (rounds, findings, pcap references) to SQLite for resume.
 
 Multiple investigation rounds can be executed, each building on the previous round's context.
+
+### System Architecture Highlights
+
+**Problem Statement:**  
+Traditional network forensics tools suffer from limited cross-protocol semantic reasoning and low-signal-to-noise ratio in logs, which can easily overwhelm LLM context windows during complex investigations.
+
+**Solution Architecture:**
+
+- **Three-Stage Pipeline**: Planner (strategic planning) → Executor (tactical execution) → Summarizer (synthesis) per round.
+  
+- **Shared State Model (State Memo)**: PlanState flows through executors, accumulating key findings and operation logs. Normal executors extract core findings after each step; subsequent executors and Final Executor depend solely on this global state to prevent redundant tool calls and dynamic loops.
+
+- **Hierarchical Context Compression**:
+  - *Conversation-level*: Compresses early tool-calling history into summaries while preserving recent interactions (~20K tokens).
+  - *Round-level*: Compresses historical reports and loads them on-demand via `history_snapshots` table.
+  - *Cross-round memory*: SQLite persistence enables long-term context across investigation rounds.
+
+- **High-Semantic-Density SQL Interface**: Heterogeneous protocol logs (`conn`, `http`, `dns`, `ssl`, `files`) unified into columnar SQL via DuckDB, supporting cross-table JOINs and multi-dimensional aggregations in a single query, replacing low-efficiency plain-text scanning with precision relational extraction.
+
+- **Five-Tuple Flow Slicing + `flow_index` Index**: `pkt2flow` splits PCAP by 5-tuple; agents first locate suspicious flows via macro-level SQL, then precisely map to per-flow PCAP slices for packet-level (`tshark`) analysis, eliminating context pollution from full-PCAP packet dumps.
 
 ---
 
@@ -90,7 +110,7 @@ Multiple investigation rounds can be executed, each building on the previous rou
 
 ### ReAct Agent Loop (Eino)
 
-Each agent (Planner and Executor) uses the Eino framework's ReAct pattern.
+Each agent (Planner and Executor) uses the Eino framework's ReAct pattern with stateful message rewriting.
 The loop follows this flow for each agent invocation:
 
 ```
@@ -101,6 +121,12 @@ The loop follows this flow for each agent invocation:
 | StatePreHandler |  2-1. Add input/tool messages to state
 |   (prepare)     |  2-2. Use state's message list as ChatModel input
 +---------+-------+  2-3. Decorate message list by user's Modifier
+          |
+          v
+  +-------+-------+
+  | MessageRewriter|  2-4. (Executor only) Compress old messages
+  | (Summarizer)  |       while keeping recent ~20K tokens
+  +-------+-------+
           |
           v
   +-------+-------+
@@ -121,22 +147,30 @@ The loop follows this flow for each agent invocation:
       |               |
       v               v
   Final         +-----+------+
-  Message       |  ToolsNode |  6. Execute tool, get Tool Response
+  Message       |  ToolsNode |  6. Execute tool (bash, file editor),
+                |            |     get Tool Response
                 +-----+------+
                       |
                       v
-                Go back to ChatModel (step 3)
+                Go back to StatePreHandler (step 2-1)
 ```
 
-Key configuration:
-- Planner Agent: `maxStep = 15` (lightweight, mostly metadata queries)
-- Executor Agent: `maxStep = 200` (deep analysis with conversation summarization)
-- The Executor Agent uses a `MessageRewriter` for context window management
-  via the Conversation Summarizer middleware.
+**Key configuration:**
+
+- **Planner Agent**: `maxStep = 200` (graph node limit), lightweight metadata queries + lightweight SQL.
+- **Executor Agent**: `maxStep = 200`, deep analysis with heavy tool usage.
+  - Rewriter pipeline: `LangHintModifier` (detects query language) → `ConversationSummarizer` (compresses messages).
+  - Supports up to ~100 ReAct loops per executor (5 graph nodes × 20 max steps).
+- **Message Rewriter** (Executor only): Intelligently compresses tool-calling history using `sum.md` prompt while preserving recent messages to manage context window explosions during long investigations.
+
+**State Persistence During Execution:**
+- `PlanState` is created fresh per `Executor.Run()` invocation.
+- State flows through graph via `compose.WithGenLocalState()` and pre/post hooks.
+- Findings and operation logs accumulate in-memory; flushed to SQLite after round completes.
 
 ### Multi-Agent Pipeline
 
-Each investigation round runs the following pipeline:
+Each investigation round runs the following pipeline with **shared state propagation**:
 
 ```
                      Round N
@@ -152,30 +186,56 @@ Each investigation round runs the following pipeline:
            |
            v
    +-------+--------+
+   | PlanState Init  |  (shared state carries forward)
+   | ResearchFindings=""
+   | OperationLog=[]
+   | KeyFindingsHistory (if multi-round)
+   +-------+--------+
+           |
+           v
+   +-------+--------+
    | For each step:  |
    |                 |
-   |  step 1..N-1:  |     +--------------+     +------------------+
-   |  Normal Step   |---->| Executor     |---->| Append findings  |
-   |                |     | Agent        |     | to research      |
-   |                |     | (maxStep=200)|     | report           |
-   |                |     +--------------+     +------------------+
+   |  step 1..N-1:  |     +-----------+     +---------------------+
+   |  Normal Step   |---->| Executor  |---->| Append to          |
+   |                |     | Agent     |     | ResearchFindings   |
+   |                |     | (ReAct)   |     | + OperationLog     |
+   |                |     +-----------+     +---------------------+
    |                |
-   |  step N:       |     +--------------+     +------------------+
-   |  Final Step    |---->| Round Summary|---->| {summary,        |
-   |                |     | (ChatModel   |     |  key_findings,   |
-   |                |     |  not ReAct)  |     |  open_questions} |
-   +-------+--------+     +--------------+     +--------+---------+
-           |                                            |
-           v                                            v
-   +-------+--------+                          +--------+---------+
-   | Save Round     |                          | Print Round      |
-   | to SQLite      |                          | Summary          |
-   +----------------+                          +------------------+
+   |  step N:       |     +-----------+     +---------------------+
+   |  Final Step    |---->| Summarizer|---->| {summary,          |
+   |                |     | (ChatModel|     |  key_findings,     |
+   |                |     |  only)    |     |  open_questions,   |
+   |                |     +-----------+     |  markdown_report}  |
+   +-------+--------+                       +---------------------+
+           |                                        |
+           v                                        v
+   +-------+----------+                   +--------+----------+
+   | Context          |                   | Round Result      |
+   | Compression      |                   | (in-memory buffer)|
+   | (if needed)      |                   +--------+----------+
+   +-------+----------+                           |
+           |                                      v
+           +----> SQLite Persist (Round+Events+Snapshots)
+                  (Atomic flush on SSE close OR CLI completion)
 ```
 
-Normal Executor prompt: `internal/prompts/normal_executor.md`
-Final Executor prompt: `internal/prompts/final_executor.md`
-Planner prompt: `internal/prompts/planner.md`
+**Key Points:**
+
+1. **State Memo Flow**: `PlanState` encapsulates `ResearchFindings`, `OperationLog`, `CurrentStepIndex`. Each normal executor step appends to global findings and logs; Final Executor reads accumulated state (no re-execution).
+
+2. **Compression Checkpoint**: Before each round, key findings and planner history are loaded from snapshots (`history_snapshots` table) or raw rounds. If compressed, early rounds are replaced by LLM summaries, preserving recent raw context.
+
+3. **Atomic Persistence**: 
+   - CLI: `defer cleanup()` flushes to SQLite after `RunInvestigation` completes.
+   - Server: `roundCollector` buffers events + round data in memory during SSE stream; on success, flushed atomically; on client disconnect, discarded (no partial DB writes).
+
+**Prompts:**
+- Planner prompt: `internal/prompts/planner.md`
+- Normal Executor prompt: `internal/prompts/normal_executor.md`
+- Final Executor prompt: `internal/prompts/final_executor.md`
+- Conversation Summarizer: `internal/prompts/sum.md`
+- Report Summarizer: `internal/prompts/sum_report.md`
 
 ### Event System
 
@@ -461,28 +521,34 @@ It contains:
 
 ## Data Layer: pcapchu-scripts
 
-`pcapchu-scripts` is a Python CLI tool that provides the structured data layer
-inside the Docker sandbox.
+`pcapchu-scripts` is a Python CLI tool that provides the **structured, high-semantic-density data layer**
+inside the Docker sandbox. It transforms raw PCAP files into SQL-queryable interfaces.
 
-### Pipeline
+### Processing Pipeline
 
 ```
 pcap file
      |
      v
-  zeek -C -r capture.pcap          -- produces JSON log files
+  zeek -C -r capture.pcap          -- produces JSON log files (NDJSON format)
+  (json-logs, extract-all-files)   -- policies for structured logging
      |
      v
-  DuckDB ingestion                  -- each .log -> a table (conn, dns, http, ...)
+  DuckDB ingestion                  -- auto-detect schema, load each .log → table
+  (read_json_auto)                  -- union_by_name=true handles schema variance
      |
      v
   pkt2flow                          -- splits pcap into per-flow .pcap files
+  (-u, -v, -x flags)                -- organized by protocol (tcp_syn, tcp_nosyn, udp, icmp)
      |
      v
-  flow_index table                  -- SQL-queryable index of flow files
+  flow_index table                  -- SQL-queryable 5-tuple → file_path index
+  (protocol, src_ip, src_port,      -- enables agent to drill from macro SQL
+   dst_ip, dst_port, ts_epoch)      -- to packet-level pcap slices
      |
      v
-  _meta_tables                      -- schema catalogue for AI agent consumption
+  _meta_tables                      -- schema catalogue + row counts
+                                    -- agents query this first to understand available data
 ```
 
 ### Commands (used by agents inside the sandbox)
@@ -511,15 +577,55 @@ cd /home/linuxbrew && pcapchu-scripts serve            # Start stdin/stdout JSON
 
 ### Key Tables
 
-| Table | Description |
-|---|---|
-| `conn` | Connection records (5-tuple, duration, bytes, history) |
-| `dns` | DNS queries and responses |
-| `http` | HTTP requests (host, URI, method, response fuids) |
-| `ssl` | TLS/SSL handshake info |
-| `files` | File analysis (MIME type, hash, extracted path) |
-| `flow_index` | Per-flow pcap file paths (from pkt2flow) |
-| `_meta_tables` | Schema catalogue (table name, row count, columns) |
+| Table | Description | Agent Query Pattern |
+|---|---|---|
+| `conn` | Connection records (5-tuple, duration, bytes, history flags) | Count by state, detect long-lived conns |
+| `dns` | DNS queries (query, response, TTL, rejected) | Find suspicious domains, failed lookups |
+| `http` | HTTP requests (host, URI, method, response code, fuids) | Detect C2 beacons, exfil patterns |
+| `ssl` | TLS/SSL handshake info (server_name, ja3, cert hash, version) | Identify uncommon ciphers, cert anomalies |
+| `files` | File analysis (MIME, size, hash, extracted path) | Cross-reference suspicious downloads, hashes |
+| `flow_index` | 5-tuple → per-flow PCAP file path index | Map SQL results to packet-level slices |
+| `_meta_tables` | Schema catalogue (name, row count, columns, types) | First query: agents discover available data |
+
+### SQL Querying Patterns
+
+**Agent use patterns (via `pcapchu-scripts query`):**
+
+1. **Schema discovery** (on each round start):
+   ```sql
+   SELECT * FROM _meta_tables;  -- agent learns what tables exist and their sizes
+   ```
+
+2. **Cross-protocol anomaly detection**:
+   ```sql
+   SELECT c.src_ip, c.dst_ip, COUNT(c.uid) as conn_count,
+          COUNT(DISTINCT h.host) as http_hosts,
+          COUNT(DISTINCT d.query) as dns_queries
+   FROM conn c
+   LEFT JOIN http h ON (c.src_ip = h.src_ip AND c.src_port = h.src_port)
+   LEFT JOIN dns d ON (c.src_ip = d.src_ip)
+   WHERE c.duration > 3600
+   GROUP BY c.src_ip, c.dst_ip
+   ORDER BY conn_count DESC;
+   ```
+
+3. **Flow slice mapping** (from SQL to packet-level):
+   ```sql
+   SELECT file_path FROM flow_index
+   WHERE src_ip = '192.168.1.10' AND dst_port = 443
+   LIMIT 1;  -- returns e.g., /home/linuxbrew/output_flows/tcp_syn/192.168.1.10_443_8.8.8.8_443_1234567890.pcap
+   ```
+
+4. **Multi-protocol correlation**:
+   ```sql
+   SELECT DISTINCT c.uid, c.src_ip, c.dst_ip, c.dst_port,
+          h.host, h.method, h.uri,
+          s.server_name, s.version
+   FROM conn c
+   LEFT JOIN http h ON h.uid = c.uid
+   LEFT JOIN ssl s ON s.uid = c.uid
+   WHERE c.dst_port IN (80, 443, 8080);
+   ```
 
 ---
 
